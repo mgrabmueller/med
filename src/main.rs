@@ -1,21 +1,15 @@
-use std::io::{self, Write, BufRead, BufReader};
+use std::io::{self, Write, BufRead, BufReader, BufWriter};
 use std::fs::{File};
 
 type Lines = Option<(usize, usize)>;
 
-struct Mark {
-    mark: char,
-}
-
 struct Line {
-    mark: Option<Mark>,
     text: String,
 }
 
 impl Line {
     fn new(s: String) -> Self {
         Line {
-            mark: None,
             text: s,
         }
     }
@@ -26,6 +20,9 @@ struct State {
     lines: Vec<Line>,
     current_line: usize,
     modified: bool,
+    last_command: Option<char>,
+    prompt: Option<String>,
+    print_prompt: bool,
 }
 
 impl State {
@@ -35,6 +32,9 @@ impl State {
             lines: Vec::new(),
             current_line: 0,
             modified: false,
+            last_command: None,
+            prompt: Some("*".into()),
+            print_prompt: false
         }
     }
 
@@ -176,8 +176,18 @@ fn any_address_err(l: Lines) -> io::Result<()> {
 // Write a prompt to stdout (without a newline) and flush it to the
 // terminal.
 fn prompt<W: Write>(state: &State, stdout: &mut W) -> io::Result<()> {
-    print!("{} * ", state.current_line);
-    stdout.flush()
+    if state.print_prompt {
+        match &state.prompt {
+            None => {
+                return err(io::ErrorKind::Other, "no prompt set");
+            },
+            Some(p) => {
+                print!("{}", p);
+                stdout.flush()?
+            },
+        }
+    }
+    Ok(())
 }
 
 // Convert a character in the range '0'..'9' (inclusive) to its
@@ -381,17 +391,44 @@ fn get_lines<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>) ->
     }
 }
  
+fn get_argument<I: Iterator<Item=char>>(input: &mut Input<I>) -> io::Result<Option<String>> {
+    input.skip_ws();
+    if input.current().is_some() {
+        let mut arg = String::new();
+        loop {
+            if let Some(c) = input.current() {
+                if c == '\n' {
+                    break;
+                }
+                arg.push(c);
+                input.skip();
+            } else {
+                break;
+            }
+        }
+        if arg.len() > 0 {
+            Ok(Some(arg))
+        } else {
+            Ok(None)
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 // Quit command (q).  Ensures that no line addresses and no parameters
 // are given and returns false, which will terminate the main loop.
-fn quit_cmd<I: Iterator<Item=char>>(_state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+fn quit_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     any_address_err(l)?;
     any_input_err(input)?;
-    match l {
-        None =>
-            Ok(false),
-        Some(_) =>
-            err(io::ErrorKind::InvalidData, "no lines accepted"),
+
+    if state.modified && state.last_command != Some('q') {
+        return err(io::ErrorKind::Other, "buffer modified")
     }
+
+    Ok(false)
 }
 
 // Print command (p).  Uses the current line as defaults if no
@@ -399,7 +436,9 @@ fn quit_cmd<I: Iterator<Item=char>>(_state: &mut State, input: &mut Input<I>, l:
 // than zero and that no parameters are given.  Then prints all lines
 // in the line range to the terminal and set the current line to the
 // last line printed.
-fn print_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+fn print_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
@@ -412,14 +451,19 @@ fn print_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l:
     Ok(true)
 }
 
-fn list_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+// List command (l). Print each line unambiguously, that means at the
+// end of each line, a dollar ($) character is printed.  All dollar
+// characters that appear on lines are prefixed with a backslash (\)
+// character.
+fn list_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
     any_input_err(input)?;
 
     for l in line1..=line2 {
-        print!("{} ", l);
         for c in state.lines[l - 1].text.chars() {
             match c {
                 '$' => print!("\\$"),
@@ -427,6 +471,23 @@ fn list_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
             }
         }
         println!("$");
+    }
+    state.current_line = line2;
+    Ok(true)
+}
+
+// Enumerate command (n). Print each line in the address range,
+// prefixing each line with it's line number.
+fn enum_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    let (line1, line2) = default_lines(l, state.current_line, state.current_line);
+
+    zero_address_err(line1)?;
+    any_input_err(input)?;
+
+    for l in line1..=line2 {
+        println!("{} {}", l, state.lines[l-1].text);
     }
     state.current_line = line2;
     Ok(true)
@@ -441,6 +502,20 @@ fn load(filename: &Option<String>) -> io::Result<Vec<String>> {
             lines.push(s?.clone());
         }
         Ok(lines)
+    } else {
+        err(io::ErrorKind::InvalidData, "no file name given")
+    }
+}
+
+fn save(state: &State, filename: &Option<String>, line1: usize, line2: usize) -> io::Result<()> {
+    if let Some(fname) = filename {
+        let mut f = BufWriter::new(File::create(fname)?);
+
+        for l in state.lines.as_slice()[line1 - 1..line2].iter() {
+            f.write_all(l.text.as_bytes())?;
+            f.write_all(b"\n")?;
+        }
+        Ok(())
     } else {
         err(io::ErrorKind::InvalidData, "no file name given")
     }
@@ -465,8 +540,12 @@ fn input_mode() -> io::Result<Vec<String>> {
     Ok(lines)
 }
 
+// Append command (a).  Read in lines from standard input until a line
+// with a single period (.) is read.  The line terminating input is
+// discarded.  The other lines are inserted into the buffer after the
+// addressed line.  The current line is set to the last line inserted.
 fn append_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
-    let (insert_line, _line2) = default_lines(l, state.current_line, state.current_line);
+    let (_line1, insert_line) = default_lines(l, state.current_line, state.current_line);
 
     // Note that line address 0 is allowed, to insert at the start of
     // the buffer.
@@ -485,11 +564,17 @@ fn append_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
     Ok(true)
 }
 
-fn insert_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
-    let (line1, _line2) = default_lines(l, state.current_line, state.current_line);
+// Insert command (i).  Read in lines from standard input until a line
+// with a single period (.) is read.  The line terminating input is
+// discarded.  The other lines are inserted into the buffer before the
+// addressed line.  The current line is set to the last line inserted.
+fn insert_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    let (_line1, insert_line0) = default_lines(l, state.current_line, state.current_line);
 
     // Note that line address 0 is allowed, it is equivalent to 1.
-    let insert_line = std::cmp::max(line1, 1);
+    let insert_line = std::cmp::max(insert_line0, 1);
     
     any_input_err(input)?;
 
@@ -506,7 +591,14 @@ fn insert_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
     Ok(true)
 }
 
-fn change_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+// Change command (c).  Read in lines from standard input until a line
+// with a single period (.) is read.  The line terminating input is
+// discarded.  The addresses lines are removed from the buffer and the
+// newly read lines are inserted in their place.  The current line is
+// set to the last line inserted.
+fn change_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
@@ -524,7 +616,11 @@ fn change_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
     Ok(true)
 }
 
-fn move_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+// Move command (m). Move the addressed lines after the line given as
+// an argument. The current line is set to the last line moved.
+fn move_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     if let Some(mut to_line) = get_line_number(state, input)? {
@@ -549,7 +645,12 @@ fn move_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
     }
 }
 
-fn transfer_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+// Transfer command (t). Copy the addressed lines and insert them
+// after the line given as an argument.  Set the current line to the
+// last line copied.
+fn transfer_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     if let Some(to_line) = get_line_number(state, input)? {
@@ -570,7 +671,12 @@ fn transfer_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>,
     }
 }
 
-fn delete_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+// Delete command (d).  Remove the addressed line from the buffer.
+// Set the current line to the line after the deleted lines, if it
+// exists and to the line before otherwise.
+fn delete_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
@@ -582,46 +688,95 @@ fn delete_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
     Ok(true)
 }
 
-fn edit_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+// Edit command (e).  Accepts an optional file name argument.  Opens
+// the file with the given name (or the current default filename if no
+// argument is given) and reads it into the edit buffer.  If the
+// buffer is modified, an error is returned.  If a filename is given,
+// it is used as the new default filename.
+fn edit_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     any_address_err(l)?;
 
-    input.skip_ws();
-    let fname =
-        if let Some(c) = input.current() {
-            let mut fname = String::new();
-            fname.push(c);
-            input.skip();
-            loop {
-                if let Some(c) = input.current() {
-                    if c == '\n' {
-                        break;
-                    }
-                    fname.push(c);
-                    input.skip();
-                } else {
-                    break;
-                }
-            }
-            if fname.len() == 0 {
-                return err(io::ErrorKind::InvalidData, "invalid file name");
-            }
-            Some(fname)
-        } else {
-            state.default_filename.clone()
-        };
+    if state.modified && state.last_command != Some('e') {
+        return err(io::ErrorKind::Other, "buffer modified")
+    }
+
+    let fname = get_argument(input)?.or(state.default_filename.clone());
 
     let lines = load(&fname)?;
     state.clear_buffer();
     state.set_lines(lines);
     state.default_filename = fname;
-    state.current_line = state.last_line();
+    Ok(true)
+}
+
+// Filename command (f).  If no argument is given, print the current
+// default filename or return an error if no default filename is
+// present. If an argument is given, set the default filename to the
+// argument.
+fn filename_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    any_address_err(l)?;
+
+    let fname = get_argument(input)?;
+    match fname {
+        None =>
+            match &state.default_filename {
+                None =>
+                    return err(io::ErrorKind::Other, "no filename"),
+                Some(f) =>
+                    println!("{}", f),
+            },
+        Some(_) =>
+            state.default_filename = fname,
+    }
+
+    Ok(true)
+}
+
+// Write command (w).  Accepts an optional file name argument.  Write
+// the addressed lines (or the complete buffer contents if no lines
+// are specified) to the given file (or the default filename if none
+// is given) and mark the buffer as unmodified.
+fn write_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    let (line1, line2) = default_lines(l, 1, state.last_line());
+
+    let fname = get_argument(input)?.or(state.default_filename.clone());
+
+    save(state, &fname, line1, line2)?;
+    state.modified = false;
+    state.default_filename = fname;
+    Ok(true)
+}
+
+// Prompt command (P).  Set the prompt to the given argument if given
+// or toggle prompt printing otherwise.
+fn prompt_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    any_address_err(l)?;
+
+    let new_prompt = get_argument(input)?;
+    match new_prompt {
+        None =>
+            state.print_prompt = !state.print_prompt,
+        Some(_) =>
+            state.prompt = new_prompt,
+    }
+
     Ok(true)
 }
 
 // Print line command (=).  Defaults lines to the last line and
 // verifies that no parameters are given.  Then prints the number of
 // the last line address.
-fn print_line_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+fn print_line_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
     let (_line1, line2) = default_lines(l, state.last_line(), state.last_line());
     
     any_input_err(input)?;
@@ -656,21 +811,33 @@ fn run<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>) -> io::R
     input.skip_ws();
 
     if let Some(c) = input.current() {
+        let mut last_cmd = Some(c);
         input.skip();
-        match c {
-            'q' => quit_cmd(state, input, lines),
-            'p' => print_cmd(state, input, lines),
-            'l' => list_cmd(state, input, lines),
-            'a' => append_cmd(state, input, lines),
-            'i' => insert_cmd(state, input, lines),
-            'c' => change_cmd(state, input, lines),
-            'm' => move_cmd(state, input, lines),
-            't' => transfer_cmd(state, input, lines),
-            'd' => delete_cmd(state, input, lines),
-            'e' => edit_cmd(state, input, lines),
-            '=' => print_line_cmd(state, input, lines),
-            _   => empty_cmd(state, input, lines),
-        }
+        let result =
+            match c {
+                'q' => quit_cmd(state, input, lines),
+                'p' => print_cmd(state, input, lines),
+                'l' => list_cmd(state, input, lines),
+                'n' => enum_cmd(state, input, lines),
+                'a' => append_cmd(state, input, lines),
+                'i' => insert_cmd(state, input, lines),
+                'c' => change_cmd(state, input, lines),
+                'm' => move_cmd(state, input, lines),
+                't' => transfer_cmd(state, input, lines),
+                'd' => delete_cmd(state, input, lines),
+                'e' => edit_cmd(state, input, lines),
+                'f' => filename_cmd(state, input, lines),
+                'w' => write_cmd(state, input, lines),
+                'P' => prompt_cmd(state, input, lines),
+                '=' => print_line_cmd(state, input, lines),
+                _   => {
+                    let res = empty_cmd(state, input, lines);
+                    last_cmd = None;
+                    res
+                },
+            };
+        state.last_command = last_cmd;
+        result
     } else {
         Ok(false)
     }
@@ -683,6 +850,16 @@ fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
 
     let mut state = State::new();
+
+    for arg in std::env::args().skip(1) {
+        if arg.len() > 0 {
+            let fname = Some(arg.clone());
+            let lines = load(&fname)?;
+            state.set_lines(lines);
+            state.default_filename = fname;
+            break;
+        }
+    }
     
     prompt(&state, &mut stdout)?;
 
