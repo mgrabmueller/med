@@ -1,0 +1,6 @@
+[package]
+name = "med"
+version = "0.1.0"
+authors = ["Martin Grabmueller <martin.grabmueller@entelios.com>"]
+
+[dependencies]
