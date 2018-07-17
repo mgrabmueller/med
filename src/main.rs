@@ -4,12 +4,14 @@ use std::fs::{File};
 type Lines = Option<(usize, usize)>;
 
 struct Line {
+    mark: bool,
     text: String,
 }
 
 impl Line {
     fn new(s: String) -> Self {
         Line {
+            mark: false,
             text: s,
         }
     }
@@ -23,6 +25,7 @@ struct State {
     last_command: Option<char>,
     prompt: Option<String>,
     print_prompt: bool,
+    last_pattern: Option<String>,
 }
 
 impl State {
@@ -34,23 +37,31 @@ impl State {
             modified: false,
             last_command: None,
             prompt: Some("*".into()),
-            print_prompt: false
+            print_prompt: false,
+            last_pattern: None,
         }
     }
 
-    fn clear_buffer(&mut self) {
-        self.lines.clear();
-        self.current_line = 0;
-        self.modified = true;
+    fn unmark(&mut self) {
+        for l in &mut self.lines {
+            l.mark = false;
+        }
     }
-    
+
     fn set_lines(&mut self, l: Vec<String>) {
         self.lines.clear();
         for s in l {
             self.lines.push(Line::new(s.into()));
         }
         self.current_line = self.last_line();
-        self.modified = false;
+    }
+
+    fn insert_lines(&mut self, after_line: usize, l: Vec<String>) {
+        for (i, s) in l.iter().enumerate() {
+            self.lines.insert(after_line + i, Line::new(s.clone()));
+        }
+        self.modified = true;
+        self.current_line = after_line + l.len();
     }
 
     fn append(&mut self, insertion_line: usize, lines: Vec<String>) {
@@ -90,17 +101,31 @@ impl State {
 struct Input<I: Iterator<Item=char>> {
     iter: I,
     lookahead: Option<char>,
+    iter_save: Vec<I>,
+    lookahead_save: Vec<Option<char>>,
 }
 
-impl<I: Iterator<Item=char>> Input<I> {
+impl<I: Iterator<Item=char> + Clone> Input<I> {
     fn new(mut iter: I) -> Self {
         let c = iter.next();
         Input{
             iter: iter,
             lookahead: c,
+            iter_save: Vec::new(),
+            lookahead_save: Vec::new(),
         }
     }
 
+    fn save(&mut self) {
+        self.iter_save.push(self.iter.clone());
+        self.lookahead_save.push(self.lookahead);
+    }
+    
+    fn restore(&mut self) {
+        self.iter = self.iter_save.pop().expect("impossible");
+        self.lookahead = self.lookahead_save.pop().expect("impossible");
+    }
+    
     fn current(&mut self) -> Option<char> {
         self.lookahead
     }
@@ -121,7 +146,7 @@ impl<I: Iterator<Item=char>> Input<I> {
 
     fn skip_all_ws(&mut self) {
         while let Some(c) = self.current() {
-            if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+            if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
                 self.skip();
             } else {
                 return;
@@ -141,13 +166,19 @@ fn address_err<R>() -> io::Result<R> {
     err(io::ErrorKind::InvalidData, "invalid line address")
 }
 
+// Construct a "missing pattern" error.
+fn missing_pattern_err<R>() -> io::Result<R> {
+    err(io::ErrorKind::InvalidData, "pattern missing")
+}
+
 // Return an error value if the given input contains any remaining
 // non-whitespace characters.  Will also ignore newlines and carriage
 // returns.
-fn any_input_err<I: Iterator<Item=char>>(input: &mut Input<I>) -> io::Result<()> {
-    input.skip_all_ws();
+fn any_arg_err<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<()> {
+    input.skip_ws();
     match input.current() {
         None => Ok(()),
+        Some('\n') => Ok(()),
         Some(_) =>
             err(io::ErrorKind::InvalidData, "no parameters allowed")
     }
@@ -209,7 +240,7 @@ fn default_lines(l: Lines, line1: usize, line2: usize) -> (usize, usize) {
 // `c`, which must be in the range '0'..'9' (inclusive).  Will stop as
 // soon as a non-numeric character is found (or a the end of input).
 // Returns the result wrapped in a `io::Result` for convenience.
-fn get_num<I: Iterator<Item=char>>(input: &mut Input<I>, c: char) -> io::Result<usize> {
+fn get_num<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, c: char) -> io::Result<usize> {
     let mut acc = atoi(c);
     input.skip();
     while let Some(c) = input.current() {
@@ -248,6 +279,22 @@ fn get_rel_line(state: &State, sign: char, base: usize, amount: usize) -> io::Re
     }
 }
 
+fn inc_mod_line(l: usize, last: usize) -> usize {
+    if l < last {
+        l + 1
+    } else {
+        1
+    }
+}
+
+fn dec_mod_line(l: usize, last: usize) -> usize {
+    if l > 1 {
+        l - 1
+    } else {
+        last
+    }
+}
+
 // Get a single line address (if there is none).  If the beginning
 // cannot parse as a line address, it will return None.  Otherwise, it
 // will parse as much as can possibly be used to create a term of the
@@ -273,7 +320,7 @@ fn get_rel_line(state: &State, sign: char, base: usize, amount: usize) -> io::Re
 // $+
 // $-
 //
-fn get_line_number<I: Iterator<Item=char>>(state: &State, input: &mut Input<I>) -> io::Result<Option<usize>> {
+fn get_line_number<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) -> io::Result<Option<usize>> {
     input.skip_ws();
     if let Some(c) = input.current() {
         let term1 =
@@ -286,6 +333,34 @@ fn get_line_number<I: Iterator<Item=char>>(state: &State, input: &mut Input<I>) 
                     input.skip();
                     state.last_line()
                 },
+                '/' => {
+                    let pat = get_pattern(input)?;
+                    let search_pat =
+                        if pat.len() == 0 {
+                            match &state.last_pattern {
+                                None => return err(io::ErrorKind::InvalidData, "no previous pattern"),
+                                Some(p) => p.clone(),
+                            }
+                        } else {
+                            pat
+                        };
+                    let mut l = inc_mod_line(state.current_line, state.last_line());
+                    let mut res = None;
+                    while l != state.current_line {
+                        if state.lines[l - 1].text.contains(&search_pat) {
+                            res = Some(l);
+                            break;
+                        }
+                        l = inc_mod_line(l, state.last_line());
+                    }
+                    match res {
+                        None => return err(io::ErrorKind::InvalidData, "no match"),
+                        Some(n) => {
+                            state.last_pattern = Some(search_pat);
+                            n
+                        },
+                    }
+                }
                 '0'..='9' => {
                     let acc = get_num(input, c)?;
                     acc
@@ -338,7 +413,7 @@ fn get_line_number<I: Iterator<Item=char>>(state: &State, input: &mut Input<I>) 
    }
 }
 
-fn get_lines<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>) -> io::Result<Lines> {
+fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) -> io::Result<Lines> {
 
     // Get optional first line address.
     let line1 = get_line_number(state, input)?;
@@ -391,7 +466,7 @@ fn get_lines<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>) ->
     }
 }
  
-fn get_argument<I: Iterator<Item=char>>(input: &mut Input<I>) -> io::Result<Option<String>> {
+fn get_argument<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<Option<String>> {
     input.skip_ws();
     if input.current().is_some() {
         let mut arg = String::new();
@@ -416,13 +491,44 @@ fn get_argument<I: Iterator<Item=char>>(input: &mut Input<I>) -> io::Result<Opti
     }
 }
 
+fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<String> {
+    input.skip_ws();
+    if let Some(c) = input.current() {
+        let mut pat = String::new();
+        let delim = c;
+        input.skip();
+        while let Some(c) = input.current() {
+            if c == '\\' {
+                input.skip();
+                if let Some(c) = input.current() {
+                    pat.push(c);
+                    input.skip();
+                } else {
+                    break;
+                }
+            } else if c == delim {
+                input.skip();
+                break;
+            } else if c == '\n' {
+                break;
+            } else {
+                pat.push(c);
+                input.skip();
+            }
+        }
+        Ok(pat)
+    } else {
+        missing_pattern_err()
+    }
+}
+
 // Quit command (q).  Ensures that no line addresses and no parameters
 // are given and returns false, which will terminate the main loop.
-fn quit_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn quit_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     any_address_err(l)?;
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     if state.modified && state.last_command != Some('q') {
         return err(io::ErrorKind::Other, "buffer modified")
@@ -436,13 +542,13 @@ fn quit_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
 // than zero and that no parameters are given.  Then prints all lines
 // in the line range to the terminal and set the current line to the
 // last line printed.
-fn print_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn print_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     for l in line1..=line2 {
         println!("{}", state.lines[l - 1].text);
@@ -455,15 +561,18 @@ fn print_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l:
 // end of each line, a dollar ($) character is printed.  All dollar
 // characters that appear on lines are prefixed with a backslash (\)
 // character.
-fn list_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn list_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     for l in line1..=line2 {
+        if state.lines[l - 1].mark {
+            print!(">");
+        }
         for c in state.lines[l - 1].text.chars() {
             match c {
                 '$' => print!("\\$"),
@@ -478,13 +587,13 @@ fn list_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
 
 // Enumerate command (n). Print each line in the address range,
 // prefixing each line with it's line number.
-fn enum_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn enum_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     for l in line1..=line2 {
         println!("{} {}", l, state.lines[l-1].text);
@@ -493,29 +602,33 @@ fn enum_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
     Ok(true)
 }
 
-fn load(filename: &Option<String>) -> io::Result<Vec<String>> {
+fn load(filename: &Option<String>) -> io::Result<(usize, Vec<String>)> {
     if let Some(fname) = filename {
+        let mut size = 0;
         let mut lines = Vec::new();
         let mut f = BufReader::new(File::open(fname)?);
 
         for s in f.lines() {
-            lines.push(s?.clone());
+            let str = s?;
+            size += str.len() + 1;
+            lines.push(str.clone());
         }
-        Ok(lines)
+        Ok((size, lines))
     } else {
         err(io::ErrorKind::InvalidData, "no file name given")
     }
 }
 
-fn save(state: &State, filename: &Option<String>, line1: usize, line2: usize) -> io::Result<()> {
+fn save(state: &State, filename: &Option<String>, line1: usize, line2: usize) -> io::Result<usize> {
     if let Some(fname) = filename {
         let mut f = BufWriter::new(File::create(fname)?);
-
+        let mut size = 0;
         for l in state.lines.as_slice()[line1 - 1..line2].iter() {
             f.write_all(l.text.as_bytes())?;
             f.write_all(b"\n")?;
+            size += l.text.len() + 1;
         }
-        Ok(())
+        Ok(size)
     } else {
         err(io::ErrorKind::InvalidData, "no file name given")
     }
@@ -544,12 +657,12 @@ fn input_mode() -> io::Result<Vec<String>> {
 // with a single period (.) is read.  The line terminating input is
 // discarded.  The other lines are inserted into the buffer after the
 // addressed line.  The current line is set to the last line inserted.
-fn append_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+fn append_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
     let (_line1, insert_line) = default_lines(l, state.current_line, state.current_line);
 
     // Note that line address 0 is allowed, to insert at the start of
     // the buffer.
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     // Read lines from stdin until a line with a single period (.) is
     // read.
@@ -568,7 +681,7 @@ fn append_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
 // with a single period (.) is read.  The line terminating input is
 // discarded.  The other lines are inserted into the buffer before the
 // addressed line.  The current line is set to the last line inserted.
-fn insert_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn insert_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (_line1, insert_line0) = default_lines(l, state.current_line, state.current_line);
@@ -576,7 +689,7 @@ fn insert_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
     // Note that line address 0 is allowed, it is equivalent to 1.
     let insert_line = std::cmp::max(insert_line0, 1);
     
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     // Read lines from stdin until a line with a single period (.) is
     // read.
@@ -596,13 +709,13 @@ fn insert_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
 // discarded.  The addresses lines are removed from the buffer and the
 // newly read lines are inserted in their place.  The current line is
 // set to the last line inserted.
-fn change_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn change_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     let lines = input_mode()?;
 
@@ -618,7 +731,7 @@ fn change_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
 
 // Move command (m). Move the addressed lines after the line given as
 // an argument. The current line is set to the last line moved.
-fn move_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn move_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
@@ -630,7 +743,7 @@ fn move_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
         }
     
         zero_address_err(line1)?;
-        any_input_err(input)?;
+        any_arg_err(input)?;
 
         let lines = state.take(line1, line2);
         
@@ -648,7 +761,7 @@ fn move_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
 // Transfer command (t). Copy the addressed lines and insert them
 // after the line given as an argument.  Set the current line to the
 // last line copied.
-fn transfer_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn transfer_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
@@ -656,7 +769,7 @@ fn transfer_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>,
     if let Some(to_line) = get_line_number(state, input)? {
     
         zero_address_err(line1)?;
-        any_input_err(input)?;
+        any_arg_err(input)?;
 
         let lines = state.copy(line1, line2);
         
@@ -674,13 +787,13 @@ fn transfer_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>,
 // Delete command (d).  Remove the addressed line from the buffer.
 // Set the current line to the line after the deleted lines, if it
 // exists and to the line before otherwise.
-fn delete_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn delete_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     state.delete(line1, line2);
     
@@ -693,7 +806,7 @@ fn delete_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
 // argument is given) and reads it into the edit buffer.  If the
 // buffer is modified, an error is returned.  If a filename is given,
 // it is used as the new default filename.
-fn edit_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn edit_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     any_address_err(l)?;
@@ -704,10 +817,30 @@ fn edit_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
 
     let fname = get_argument(input)?.or(state.default_filename.clone());
 
-    let lines = load(&fname)?;
-    state.clear_buffer();
+    let (size, lines) = load(&fname)?;
     state.set_lines(lines);
+    state.modified = false;
     state.default_filename = fname;
+    println!("{}", size);
+    Ok(true)
+}
+
+// Read command (r).  Accepts an optional file name argument.  Opens
+// the file with the given name (or the current default filename if no
+// argument is given) and inserts it into the edit buffer at the given
+// line (or current line, if no line is given).  The default filename
+// is unchanged.
+fn read_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    let (_line1, line2) = default_lines(l, state.last_line(), state.last_line());
+
+    let fname = get_argument(input)?.or(state.default_filename.clone());
+
+    let (size, lines) = load(&fname)?;
+    state.insert_lines(line2, lines);
+    println!("{}", size);
+    
     Ok(true)
 }
 
@@ -715,7 +848,7 @@ fn edit_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: 
 // default filename or return an error if no default filename is
 // present. If an argument is given, set the default filename to the
 // argument.
-fn filename_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn filename_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     any_address_err(l)?;
@@ -740,22 +873,23 @@ fn filename_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>,
 // the addressed lines (or the complete buffer contents if no lines
 // are specified) to the given file (or the default filename if none
 // is given) and mark the buffer as unmodified.
-fn write_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn write_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (line1, line2) = default_lines(l, 1, state.last_line());
 
     let fname = get_argument(input)?.or(state.default_filename.clone());
 
-    save(state, &fname, line1, line2)?;
+    let size = save(state, &fname, line1, line2)?;
     state.modified = false;
     state.default_filename = fname;
+    println!("{}", size);
     Ok(true)
 }
 
 // Prompt command (P).  Set the prompt to the given argument if given
 // or toggle prompt printing otherwise.
-fn prompt_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn prompt_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     any_address_err(l)?;
@@ -771,15 +905,66 @@ fn prompt_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l
     Ok(true)
 }
 
+// Work horse for the g and v commands.
+fn global_execute<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines, include: bool) ->
+    io::Result<bool>
+{
+    let (line1, line2) = default_lines(l, 1, state.last_line());
+
+    let pat = get_pattern(input)?;
+
+    state.unmark();
+
+    for line in line1 ..= line2 {
+        if state.lines[line - 1].text.contains(&pat) == include {
+            state.lines[line - 1].mark = true;
+        }
+    }
+
+    input.skip_all_ws();
+
+    // No for loop here, because lines can be added or deleted by the
+    // executed commands.
+    let mut line = 1;
+    while line <= state.last_line() {
+        if state.lines[line - 1].mark {
+            state.current_line = line;
+
+            input.save();
+            run_one(state, input)?;
+            input.restore();
+        }
+        line += 1;
+    }
+    Ok(true)
+}
+
+// Global command (g).  Mark a set of lines matching the argument and
+// then execute the following commands on all of the marked lines.
+fn global_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    global_execute(state, input, l, true)
+}
+
+// Global exclusion command (v).  Mark a set of lines NOT matching the
+// argument and then execute the following commands on all of the
+// marked lines.
+fn vlobal_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    global_execute(state, input, l, false)
+}
+
 // Print line command (=).  Defaults lines to the last line and
 // verifies that no parameters are given.  Then prints the number of
 // the last line address.
-fn print_line_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+fn print_line_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
     io::Result<bool>
 {
     let (_line1, line2) = default_lines(l, state.last_line(), state.last_line());
     
-    any_input_err(input)?;
+    any_arg_err(input)?;
 
     println!("{}", line2);
     Ok(true)
@@ -789,13 +974,13 @@ fn print_line_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I
 // are given, it sets the current line to the last line, otherwise, it
 // prints the current line and increments the current line number,
 // wrapping around to the first line if necessary.
-fn empty_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
-    any_input_err(input)?;
+fn empty_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) -> io::Result<bool> {
+    any_arg_err(input)?;
 
     match l {
         None => {
-            print_cmd(state, input, None)?;
             state.next_line();
+            print_cmd(state, input, None)?;
             Ok(true)
         },
         Some((_l1, l2)) => {
@@ -806,7 +991,64 @@ fn empty_cmd<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>, l:
     }
 }
 
-fn run<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>) -> io::Result<bool> {
+// Read a line of commands from the given input, handling lines with
+// trailing backslashes (`\`) by removing them and concatenating them
+// with the following line(s).
+fn read_command_line<W: Write, R: BufRead>(state: &mut State, stdin: &mut R, stdout: &mut W) -> io::Result<Option<String>> {
+    let mut buf = String::new();
+
+    prompt(&state, stdout)?;
+
+    if stdin.read_line(&mut buf)? > 0 {
+        while buf.ends_with("\\\n") {
+            let _ = buf.pop();
+            let _ = buf.pop();
+            buf.push('\n');
+            if stdin.read_line(&mut buf)? == 0 {
+                break;
+            }
+        }
+        return Ok(Some(buf));
+    } else {
+        Ok(None)
+    }
+}
+
+fn run_one<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) -> io::Result<bool> {
+    let lines = get_lines(state, input)?;
+    input.skip_ws();
+
+    if let Some(c) = input.current() {
+        input.skip();
+        let result =
+            match c {
+                'q' => quit_cmd(state, input, lines),
+                'p' => print_cmd(state, input, lines),
+                'l' => list_cmd(state, input, lines),
+                'n' => enum_cmd(state, input, lines),
+                'a' => append_cmd(state, input, lines),
+                'i' => insert_cmd(state, input, lines),
+                'c' => change_cmd(state, input, lines),
+                'm' => move_cmd(state, input, lines),
+                't' => transfer_cmd(state, input, lines),
+                'd' => delete_cmd(state, input, lines),
+                'e' => edit_cmd(state, input, lines),
+                'f' => filename_cmd(state, input, lines),
+                'w' => write_cmd(state, input, lines),
+                'r' => read_cmd(state, input, lines),
+                '=' => print_line_cmd(state, input, lines),
+                '\n' => empty_cmd(state, input, lines),
+                _   => {
+                    err(io::ErrorKind::InvalidData, "unknown command")
+                },
+            };
+        result
+    } else {
+        print_cmd(state, input, lines)
+    }
+}
+
+fn run<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) -> io::Result<bool> {
     let lines = get_lines(state, input)?;
     input.skip_ws();
 
@@ -828,12 +1070,14 @@ fn run<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>) -> io::R
                 'e' => edit_cmd(state, input, lines),
                 'f' => filename_cmd(state, input, lines),
                 'w' => write_cmd(state, input, lines),
+                'r' => read_cmd(state, input, lines),
+                'g' => global_cmd(state, input, lines),
+                'v' => vlobal_cmd(state, input, lines),
                 'P' => prompt_cmd(state, input, lines),
                 '=' => print_line_cmd(state, input, lines),
+                '\n' => empty_cmd(state, input, lines),
                 _   => {
-                    let res = empty_cmd(state, input, lines);
-                    last_cmd = None;
-                    res
+                    err(io::ErrorKind::InvalidData, "unknown command")
                 },
             };
         state.last_command = last_cmd;
@@ -844,27 +1088,36 @@ fn run<I: Iterator<Item=char>>(state: &mut State, input: &mut Input<I>) -> io::R
 }
 
 fn main() -> io::Result<()> {
-    let mut buf = String::new();
-
-    let stdin = io::stdin();
+    let mut stdin = BufReader::new(io::stdin());
     let mut stdout = io::stdout();
 
     let mut state = State::new();
 
     for arg in std::env::args().skip(1) {
         if arg.len() > 0 {
-            let fname = Some(arg.clone());
-            let lines = load(&fname)?;
-            state.set_lines(lines);
-            state.default_filename = fname;
+            let fname = arg.clone();
+            match load(&Some(fname.clone())) {
+                Ok((size, lines)) => {
+                    state.set_lines(lines);
+                    state.default_filename = Some(fname);
+                    println!("{}", size);
+                },
+                Err(e) =>  {
+                    eprintln!("{}: {}", fname, e);
+
+                    // If the file does not exist, we remember the
+                    // filename because the user might want to create
+                    // a new file.
+                    if e.kind() == io::ErrorKind::NotFound {
+                        state.default_filename = Some(fname);
+                    }
+                },
+            }
             break;
         }
     }
-    
-    prompt(&state, &mut stdout)?;
 
-    let mut cnt = stdin.read_line(&mut buf)?;
-    while cnt > 0 {
+    while let Some(buf) = read_command_line(&mut state, &mut stdin, &mut stdout)? {
         match run(&mut state, &mut Input::new(buf.chars())) {
             Ok(true) => {
             },
@@ -874,11 +1127,8 @@ fn main() -> io::Result<()> {
             Err(e) =>
                 println!("? {}", e),
         }
-        
-        buf.clear();
-        prompt(&state, &mut stdout)?;
-        cnt = stdin.read_line(&mut buf)?;
     }
+    
 
     Ok(())
 }
