@@ -25,7 +25,7 @@ struct State {
     last_command: Option<char>,
     prompt: Option<String>,
     print_prompt: bool,
-    last_pattern: Option<String>,
+    last_pattern: Option<CompiledPat>,
 }
 
 impl State {
@@ -70,21 +70,21 @@ impl State {
         }
         self.modified = true;
     }
-    
+
     fn delete(&mut self, from_line: usize, to_line: usize) {
         let _removed: Vec<Line> = self.lines.drain(from_line - 1..=to_line - 1).collect();
         self.modified = true;
     }
-    
+
     fn take(&mut self, from_line: usize, to_line: usize) -> Vec<String> {
         self.modified = true;
         self.lines.drain(from_line - 1..=to_line - 1).map(| l | l.text).collect()
     }
-    
+
     fn copy(&mut self, from_line: usize, to_line: usize) -> Vec<String> {
         self.lines.as_slice()[from_line - 1..=to_line - 1].iter().map(| l | l.text.clone()).collect()
     }
-    
+
     fn last_line(&self) -> usize {
         self.lines.len()
     }
@@ -120,12 +120,12 @@ impl<I: Iterator<Item=char> + Clone> Input<I> {
         self.iter_save.push(self.iter.clone());
         self.lookahead_save.push(self.lookahead);
     }
-    
+
     fn restore(&mut self) {
         self.iter = self.iter_save.pop().expect("impossible");
         self.lookahead = self.lookahead_save.pop().expect("impossible");
     }
-    
+
     fn current(&mut self) -> Option<char> {
         self.lookahead
     }
@@ -169,6 +169,11 @@ fn address_err<R>() -> io::Result<R> {
 // Construct a "missing pattern" error.
 fn missing_pattern_err<R>() -> io::Result<R> {
     err(io::ErrorKind::InvalidData, "pattern missing")
+}
+
+// Construct a "invalid pattern" error.
+fn invalid_pattern_err<R>() -> io::Result<R> {
+    err(io::ErrorKind::InvalidData, "invalid pattern")
 }
 
 // Return an error value if the given input contains any remaining
@@ -279,6 +284,8 @@ fn get_rel_line(state: &State, sign: char, base: usize, amount: usize) -> io::Re
     }
 }
 
+// Increment the line number `l`, wrapping around to the first line if
+// necessary.
 fn inc_mod_line(l: usize, last: usize) -> usize {
     if l < last {
         l + 1
@@ -287,11 +294,60 @@ fn inc_mod_line(l: usize, last: usize) -> usize {
     }
 }
 
+// Decrement the line number `l`, wrapping around to the last line if
+// necessary.
 fn dec_mod_line(l: usize, last: usize) -> usize {
     if l > 1 {
         l - 1
     } else {
         last
+    }
+}
+
+// Get the line address matching the pattern at the current input
+// position, which starts with character `scan_char` (either `/` or
+// `?`).
+fn get_scan_pattern<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>,
+                                                    scan_char: char) ->
+    io::Result<usize>
+{
+    let pat = get_pattern(input)?;
+    let search_pat =
+        if pat.len() == 0 {
+            match &state.last_pattern {
+                None => return err(io::ErrorKind::InvalidData, "no previous pattern"),
+                Some(p) => p.clone(),
+            }
+        } else {
+            pat
+        };
+    let mut l =
+        if scan_char == '/' {
+            inc_mod_line(state.current_line, state.last_line())
+        } else {
+            dec_mod_line(state.current_line, state.last_line())
+        };
+    let mut res = None;
+    while l != state.current_line {
+        let mtch = match_pattern(&search_pat, &state.lines[l - 1].text);
+        if mtch.len() > 0 {
+            res = Some(l);
+            break;
+        }
+        l =
+            if scan_char == '/' {
+                inc_mod_line(l, state.last_line())
+            } else {
+                dec_mod_line(l, state.last_line())
+            };
+
+    }
+    match res {
+        None => return err(io::ErrorKind::InvalidData, "no match"),
+        Some(n) => {
+            state.last_pattern = Some(search_pat);
+            Ok(n)
+        },
     }
 }
 
@@ -333,34 +389,8 @@ fn get_line_number<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mu
                     input.skip();
                     state.last_line()
                 },
-                '/' => {
-                    let pat = get_pattern(input)?;
-                    let search_pat =
-                        if pat.len() == 0 {
-                            match &state.last_pattern {
-                                None => return err(io::ErrorKind::InvalidData, "no previous pattern"),
-                                Some(p) => p.clone(),
-                            }
-                        } else {
-                            pat
-                        };
-                    let mut l = inc_mod_line(state.current_line, state.last_line());
-                    let mut res = None;
-                    while l != state.current_line {
-                        if state.lines[l - 1].text.contains(&search_pat) {
-                            res = Some(l);
-                            break;
-                        }
-                        l = inc_mod_line(l, state.last_line());
-                    }
-                    match res {
-                        None => return err(io::ErrorKind::InvalidData, "no match"),
-                        Some(n) => {
-                            state.last_pattern = Some(search_pat);
-                            n
-                        },
-                    }
-                }
+                '/' => get_scan_pattern(state, input, c)?,
+                '?' => get_scan_pattern(state, input, c)?,
                 '0'..='9' => {
                     let acc = get_num(input, c)?;
                     acc
@@ -407,13 +437,15 @@ fn get_line_number<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mu
         } else {
             Ok(Some(term1))
         }
-                
+
    } else {
        Ok(None)
    }
 }
 
-fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) -> io::Result<Lines> {
+fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) ->
+    io::Result<Lines>
+{
 
     // Get optional first line address.
     let line1 = get_line_number(state, input)?;
@@ -429,8 +461,14 @@ fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
     // Now check for second line address.
     input.skip_ws();
     if let Some(c) = input.current() {
-        if c == ',' {
+        if c == ',' || c == ';' {
             input.skip();
+
+            if c == ';' {
+                if let Some(l1) = line1 {
+                    state.current_line = l1;
+                }
+            }
 
             // Get optional second line address.
             let line2 = get_line_number(state, input)?;
@@ -465,7 +503,7 @@ fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
         }
     }
 }
- 
+
 fn get_argument<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<Option<String>> {
     input.skip_ws();
     if input.current().is_some() {
@@ -491,18 +529,106 @@ fn get_argument<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Res
     }
 }
 
-fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<String> {
+fn get_char_class<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<String> {
+    let mut class = String::new();
+    while let Some(c) = input.current() {
+        match c {
+            ']' => {
+                input.skip();
+                if class.len() == 0 {
+                    class.push(c);
+                } else {
+                    break;
+                }
+            },
+            '-' => {
+                input.skip();
+                if class.len() == 0 {
+                    class.push(c);
+                } else {
+                    class.push(c);
+                }
+            },
+            '\n' => {
+                break;
+            },
+            _ => {
+                input.skip();
+                class.push(c);
+            },
+        }
+    }
+    Ok(class)
+}
+
+#[derive(Debug, Clone)]
+struct CompiledPat(Vec<Pat>);
+
+impl CompiledPat {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Pat {
+    Any,
+    Char(char),
+    Class(String),
+    Star,
+    GroupStart(usize),
+    GroupEnd(usize),
+}
+
+
+fn match_pattern(cpat: &CompiledPat, target0: &str) -> Vec<usize> {
+    let _target = target0.chars().collect::<Vec<char>>();
+    let matches = Vec::new();
+    let _pats = &cpat.0;
+
+
+    matches
+}
+
+fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<CompiledPat> {
     input.skip_ws();
     if let Some(c) = input.current() {
         let mut pat = String::new();
+        let mut comp_pat = Vec::new();
+        let mut group = 1;
+        let mut group_stack = Vec::new();
+        comp_pat.push(Pat::GroupStart(0));
+        group_stack.push(0);
         let delim = c;
         input.skip();
         while let Some(c) = input.current() {
             if c == '\\' {
                 input.skip();
                 if let Some(c) = input.current() {
-                    pat.push(c);
-                    input.skip();
+                    match c {
+                        '(' => {
+                            pat.push(c);
+                            comp_pat.push(Pat::GroupStart(group));
+                            group_stack.push(group);
+                            group += 1;
+                            input.skip();
+                        },
+                        ')' => {
+                            pat.push(c);
+                            match group_stack.pop() {
+                                None =>
+                                    return invalid_pattern_err(),
+                                Some(g) =>
+                                    comp_pat.push(Pat::GroupEnd(g)),
+                            }
+                            input.skip();
+                        },
+                        _ => {
+                            pat.push(c);
+                            comp_pat.push(Pat::Char(c));
+                            input.skip();
+                        }
+                    }
                 } else {
                     break;
                 }
@@ -511,12 +637,31 @@ fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Resu
                 break;
             } else if c == '\n' {
                 break;
+            } else if c == '[' {
+                input.skip();
+                let class = get_char_class(input)?;
+                pat.push_str(&class);
+                comp_pat.push(Pat::Class(class));
+            } else if c == '.' {
+                input.skip();
+                pat.push(c);
+                comp_pat.push(Pat::Any);
+            } else if c == '*' {
+                input.skip();
+                if pat.len() == 0 {
+                    return invalid_pattern_err();
+                } else {
+                    pat.push(c);
+                    comp_pat.push(Pat::Star);
+                }
             } else {
                 pat.push(c);
+                comp_pat.push(Pat::Char(c));
                 input.skip();
             }
         }
-        Ok(pat)
+        comp_pat.push(Pat::GroupEnd(0));
+        Ok(CompiledPat(comp_pat))
     } else {
         missing_pattern_err()
     }
@@ -637,7 +782,7 @@ fn save(state: &State, filename: &Option<String>, line1: usize, line2: usize) ->
 fn input_mode() -> io::Result<Vec<String>> {
     let mut lines = Vec::new();
     let mut buf = String::new();
-    
+
     let stdin = io::stdin();
 
     let mut cnt = stdin.read_line(&mut buf)?;
@@ -669,10 +814,10 @@ fn append_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     let lines = input_mode()?;
 
     let line_count = lines.len();
-    
+
     // Insert into buffer after the given first line address.
     state.append(insert_line, lines);
-    
+
     state.current_line = insert_line + line_count;
     Ok(true)
 }
@@ -688,7 +833,7 @@ fn insert_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 
     // Note that line address 0 is allowed, it is equivalent to 1.
     let insert_line = std::cmp::max(insert_line0, 1);
-    
+
     any_arg_err(input)?;
 
     // Read lines from stdin until a line with a single period (.) is
@@ -696,10 +841,10 @@ fn insert_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     let lines = input_mode()?;
 
     let line_count = lines.len();
-    
+
     // Insert into buffer after the given first line address.
     state.append(insert_line - 1, lines);
-    
+
     state.current_line = insert_line + line_count - 1;
     Ok(true)
 }
@@ -720,11 +865,11 @@ fn change_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     let lines = input_mode()?;
 
     state.delete(line1, line2);
-    
+
     let line_count = lines.len();
-    
+
     state.append(line1 - 1, lines);
-    
+
     state.current_line = line1 + line_count - 1;
     Ok(true)
 }
@@ -737,20 +882,20 @@ fn move_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     if let Some(mut to_line) = get_line_number(state, input)? {
-    
+
         if to_line >= line1 {
             to_line -= (line2 - line1) + 1;
         }
-    
+
         zero_address_err(line1)?;
         any_arg_err(input)?;
 
         let lines = state.take(line1, line2);
-        
+
         let line_count = lines.len();
-        
+
         state.append(to_line, lines);
-    
+
         state.current_line = to_line + line_count;
         Ok(true)
     } else {
@@ -767,16 +912,16 @@ fn transfer_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut I
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     if let Some(to_line) = get_line_number(state, input)? {
-    
+
         zero_address_err(line1)?;
         any_arg_err(input)?;
 
         let lines = state.copy(line1, line2);
-        
+
         let line_count = lines.len();
-        
+
         state.append(to_line, lines);
-    
+
         state.current_line = to_line + line_count;
         Ok(true)
     } else {
@@ -796,7 +941,7 @@ fn delete_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     any_arg_err(input)?;
 
     state.delete(line1, line2);
-    
+
     state.current_line = std::cmp::min(state.last_line(), line1);
     Ok(true)
 }
@@ -840,7 +985,7 @@ fn read_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
     let (size, lines) = load(&fname)?;
     state.insert_lines(line2, lines);
     println!("{}", size);
-    
+
     Ok(true)
 }
 
@@ -916,7 +1061,10 @@ fn global_execute<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut
     state.unmark();
 
     for line in line1 ..= line2 {
-        if state.lines[line - 1].text.contains(&pat) == include {
+        let matches = match_pattern(&pat, &state.lines[line - 1].text);
+        if matches.len() > 0 && include {
+            state.lines[line - 1].mark = true;
+        } else if matches.len() == 0 && !include {
             state.lines[line - 1].mark = true;
         }
     }
@@ -963,7 +1111,7 @@ fn print_line_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut
     io::Result<bool>
 {
     let (_line1, line2) = default_lines(l, state.last_line(), state.last_line());
-    
+
     any_arg_err(input)?;
 
     println!("{}", line2);
@@ -1117,6 +1265,9 @@ fn main() -> io::Result<()> {
         }
     }
 
+    // Main loop. Read top-level commands an execute them until one of
+    // them returns false (indicating that the loop should not
+    // continue).
     while let Some(buf) = read_command_line(&mut state, &mut stdin, &mut stdout)? {
         match run(&mut state, &mut Input::new(buf.chars())) {
             Ok(true) => {
@@ -1128,7 +1279,6 @@ fn main() -> io::Result<()> {
                 println!("? {}", e),
         }
     }
-    
 
     Ok(())
 }
