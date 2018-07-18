@@ -25,7 +25,7 @@ struct State {
     last_command: Option<char>,
     prompt: Option<String>,
     print_prompt: bool,
-    last_pattern: Option<CompiledPat>,
+    last_pattern: Option<Vec<Pat>>,
 }
 
 impl State {
@@ -564,104 +564,115 @@ fn get_char_class<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::R
 #[derive(Debug, Clone)]
 struct CompiledPat(Vec<Pat>);
 
-impl CompiledPat {
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-}
-
 #[derive(Debug, Clone)]
 enum Pat {
     Any,
     Char(char),
     Class(String),
-    Star,
-    GroupStart(usize),
-    GroupEnd(usize),
+    Star(Box<Pat>),
+    Group(usize, Vec<Pat>),
 }
 
 
-fn match_pattern(cpat: &CompiledPat, target0: &str) -> Vec<usize> {
+fn match_pattern(cpat: &Vec<Pat>, target0: &str) -> Vec<usize> {
     let _target = target0.chars().collect::<Vec<char>>();
     let matches = Vec::new();
-    let _pats = &cpat.0;
+    let _pats = cpat;
 
 
     matches
 }
 
-fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<CompiledPat> {
-    input.skip_ws();
+fn get_atomic_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, delim: char, group_num: &mut usize, group_nesting: &mut usize) ->
+    io::Result<Pat>
+{
     if let Some(c) = input.current() {
-        let mut pat = String::new();
-        let mut comp_pat = Vec::new();
-        let mut group = 1;
-        let mut group_stack = Vec::new();
-        comp_pat.push(Pat::GroupStart(0));
-        group_stack.push(0);
-        let delim = c;
-        input.skip();
-        while let Some(c) = input.current() {
-            if c == '\\' {
+        if c == '\\' {
+            input.skip();
+            if let Some(c) = input.current() {
                 input.skip();
-                if let Some(c) = input.current() {
-                    match c {
-                        '(' => {
-                            pat.push(c);
-                            comp_pat.push(Pat::GroupStart(group));
-                            group_stack.push(group);
-                            group += 1;
-                            input.skip();
-                        },
-                        ')' => {
-                            pat.push(c);
-                            match group_stack.pop() {
-                                None =>
-                                    return invalid_pattern_err(),
-                                Some(g) =>
-                                    comp_pat.push(Pat::GroupEnd(g)),
-                            }
-                            input.skip();
-                        },
-                        _ => {
-                            pat.push(c);
-                            comp_pat.push(Pat::Char(c));
-                            input.skip();
-                        }
-                    }
+                Ok(Pat::Char(c))
+            } else {
+                invalid_pattern_err()
+            }
+        } else if c == '(' {
+            input.skip();
+
+            *group_nesting = *group_nesting + 1;
+            let sub_pat = get_pattern1(input, delim, group_num, group_nesting)?;
+            *group_nesting = *group_nesting - 1;
+
+            if let Some(c) = input.current() {
+                if c == ')' {
+                    input.skip();
                 } else {
-                    break;
-                }
-            } else if c == delim {
-                input.skip();
-                break;
-            } else if c == '\n' {
-                break;
-            } else if c == '[' {
-                input.skip();
-                let class = get_char_class(input)?;
-                pat.push_str(&class);
-                comp_pat.push(Pat::Class(class));
-            } else if c == '.' {
-                input.skip();
-                pat.push(c);
-                comp_pat.push(Pat::Any);
-            } else if c == '*' {
-                input.skip();
-                if pat.len() == 0 {
                     return invalid_pattern_err();
-                } else {
-                    pat.push(c);
-                    comp_pat.push(Pat::Star);
                 }
             } else {
-                pat.push(c);
-                comp_pat.push(Pat::Char(c));
-                input.skip();
+                return invalid_pattern_err();
             }
+            let gn = *group_num;
+            *group_num = *group_num + 1;
+            Ok(Pat::Group(gn, sub_pat))
+        } else if c == '[' {
+            input.skip();
+            let class = get_char_class(input)?;
+            Ok(Pat::Class(class))
+        } else if c == '.' {
+            input.skip();
+            Ok(Pat::Any)
+        } else {
+            input.skip();
+            Ok(Pat::Char(c))
         }
-        comp_pat.push(Pat::GroupEnd(0));
-        Ok(CompiledPat(comp_pat))
+    } else {
+        invalid_pattern_err()
+    }
+}
+
+fn get_pattern1<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, delim: char, group_num: &mut usize, group_nesting: &mut usize) ->
+    io::Result<Vec<Pat>>
+{
+    let mut pattern = Vec::new();
+
+    while let Some(c) = input.current() {
+        if c == delim {
+            break;
+        } else if c == '\n' {
+            break;
+        } else if c == ')' {
+            break;
+        } else {
+            let mut sub_pat = get_atomic_pattern(input, delim, group_num, group_nesting)?;
+            if let Some(c) = input.current() {
+                if c == '*' {
+                    input.skip();
+                    sub_pat = Pat::Star(Box::new(sub_pat));
+                }
+            }
+            pattern.push(sub_pat);
+        }
+    }
+    Ok(pattern)
+}
+
+fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<Vec<Pat>> {
+    input.skip_ws();
+
+    if let Some(c) = input.current() {
+        let delim = c;
+        
+        input.skip();
+        
+        let mut group_num = 0;
+        let mut group_nesting = 0;
+
+        let pat = get_pattern1(input, delim, &mut group_num, &mut group_nesting)?;
+        if group_nesting != 0 {
+            invalid_pattern_err()
+        } else {
+            Ok(pat)
+        }
     } else {
         missing_pattern_err()
     }
