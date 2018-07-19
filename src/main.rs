@@ -570,6 +570,8 @@ enum Pat {
     Char(char),
     Class(String),
     Star(Box<Pat>),
+    Alt(Vec<Vec<Pat>>),
+    AGroup(Vec<Pat>),
     Group(usize, Vec<Pat>),
 }
 
@@ -599,7 +601,7 @@ fn get_atomic_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, deli
             input.skip();
 
             *group_nesting = *group_nesting + 1;
-            let sub_pat = get_pattern1(input, delim, group_num, group_nesting)?;
+            let sub_pat = get_pattern0(input, delim, group_num, group_nesting)?;
             *group_nesting = *group_nesting - 1;
 
             if let Some(c) = input.current() {
@@ -611,9 +613,15 @@ fn get_atomic_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, deli
             } else {
                 return invalid_pattern_err();
             }
-            let gn = *group_num;
-            *group_num = *group_num + 1;
-            Ok(Pat::Group(gn, sub_pat))
+            let ret =
+                if *group_nesting == 0 {
+                    let gn = *group_num;
+                    *group_num = *group_num + 1;
+                    Pat::Group(gn, sub_pat)
+                } else {
+                    Pat::AGroup(sub_pat)
+                };
+            Ok(ret)
         } else if c == '[' {
             input.skip();
             let class = get_char_class(input)?;
@@ -642,6 +650,8 @@ fn get_pattern1<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, delim: cha
             break;
         } else if c == ')' {
             break;
+        } else if c == '|' {
+            break;
         } else {
             let mut sub_pat = get_atomic_pattern(input, delim, group_num, group_nesting)?;
             if let Some(c) = input.current() {
@@ -656,6 +666,31 @@ fn get_pattern1<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, delim: cha
     Ok(pattern)
 }
 
+fn get_pattern0<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, delim: char, group_num: &mut usize, group_nesting: &mut usize) ->
+    io::Result<Vec<Pat>>
+{
+    let mut pats = Vec::new();
+    
+    let mut pat1 = get_pattern1(input, delim, group_num, group_nesting)?;
+    pats.push(pat1);
+    while let Some(c) = input.current() {
+        if c != '|' {
+            break;
+        }
+        input.skip();
+        pat1 = get_pattern1(input, delim, group_num, group_nesting)?;
+        pats.push(pat1);
+    }
+    if pats.len() == 1 {
+        let p = pats.pop().unwrap();
+        Ok(p)
+    } else {
+        let mut rpat = Vec::new();
+        rpat.push(Pat::Alt(pats));
+        Ok(rpat)
+    }
+}
+
 fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<Vec<Pat>> {
     input.skip_ws();
 
@@ -664,10 +699,10 @@ fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Resu
         
         input.skip();
         
-        let mut group_num = 0;
+        let mut group_num = 1;
         let mut group_nesting = 0;
 
-        let pat = get_pattern1(input, delim, &mut group_num, &mut group_nesting)?;
+        let pat = get_pattern0(input, delim, &mut group_num, &mut group_nesting)?;
         if group_nesting != 0 {
             invalid_pattern_err()
         } else {
