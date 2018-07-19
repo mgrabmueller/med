@@ -3,6 +3,12 @@ use std::fs::{File};
 
 type Lines = Option<(usize, usize)>;
 
+enum PrintFlag {
+    Print,
+    Enumerate,
+    List,
+}
+
 struct Line {
     mark: bool,
     mark_char: Option<char>,
@@ -814,9 +820,8 @@ fn print_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
     zero_address_err(line1)?;
     any_arg_err(input)?;
 
-    for l in line1..=line2 {
-        println!("{}", state.lines[l - 1].text);
-    }
+    do_print(state, line1, line2, Some(PrintFlag::Print));
+    
     state.current_line = line2;
     Ok(true)
 }
@@ -833,26 +838,8 @@ fn list_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
     zero_address_err(line1)?;
     any_arg_err(input)?;
 
-    for l in line1..=line2 {
-        for c in state.lines[l - 1].text.chars() {
-            match c {
-                '$' => print!("\\$"),
-                '\t' => print!(">"),
-                '\x08' => print!("<"),
-                _ =>
-                    if c < ' ' {
-                        // Formula taken from 2.11BSD ed (see
-                        // https://minnie.tuhs.org//cgi-bin/utree.pl?file=2.11BSD/src/bin/ed.c)
-                        let l1 = (((c as u8) >> 3) + ('0' as u8)) as char;
-                        let l2 = (((c as u8) & 0x7) + ('0' as u8)) as char;
-                        print!("\\{}{}", l1, l2);
-                    } else {
-                        print!("{}", c);
-                    },
-            }
-        }
-        println!("$");
-    }
+    do_print(state, line1, line2, Some(PrintFlag::List));
+
     state.current_line = line2;
     Ok(true)
 }
@@ -867,11 +854,8 @@ fn enum_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
     zero_address_err(line1)?;
     any_arg_err(input)?;
 
-    for l in line1..=line2 {
-        println!("{} {}",
-                 l,
-                 state.lines[l-1].text);
-    }
+    do_print(state, line1, line2, Some(PrintFlag::Enumerate));
+
     state.current_line = line2;
     Ok(true)
 }
@@ -1074,6 +1058,52 @@ fn delete_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     state.delete(line1, line2);
 
     state.current_line = std::cmp::min(state.last_line(), line1);
+    Ok(true)
+}
+
+fn print_flag<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> Option<PrintFlag>
+{
+    if let Some(c) = input.current() {
+        match c {
+            'p' => { input.skip(); Some(PrintFlag::Print) },
+            'n' => { input.skip(); Some(PrintFlag::Enumerate) },
+            'l' => { input.skip(); Some(PrintFlag::List) },
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+// Join command (j). Join all lines in the given range, or if only one
+// line is given, join that line with the following one.
+fn join_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    let (line1, mut line2) = default_lines(l, state.current_line, state.current_line);
+
+    zero_address_err(line1)?;
+    let pflag = print_flag(input);
+    any_arg_err(input)?;
+
+    if line1 == line2 {
+        if line1 == state.last_line() {
+            return Ok(true);
+        }
+        line2 = line1 + 1;
+    }
+    let lines = state.take(line1, line2);
+
+    let mut new_line = String::new();
+    for l in lines {
+        new_line.extend(l.chars());
+    }
+
+    state.append(line1 - 1, vec![new_line]);
+
+    do_print(state, line1, line1, pflag);
+    
+    state.current_line = line1;
     Ok(true)
 }
 
@@ -1296,6 +1326,46 @@ fn empty_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
     }
 }
 
+fn do_print(state: &State, line1: usize, line2: usize, pflag: Option<PrintFlag>) {
+    match pflag {
+        Some(PrintFlag::Print) => {
+            for l in line1..=line2 {
+                println!("{}", state.lines[l - 1].text);
+            }
+        },
+        Some(PrintFlag::Enumerate) => {
+            for l in line1..=line2 {
+                println!("{} {}",
+                         l,
+                         state.lines[l-1].text);
+            }
+        },
+        Some(PrintFlag::List) => {
+            for l in line1..=line2 {
+                for c in state.lines[l - 1].text.chars() {
+                    match c {
+                        '$' => print!("\\$"),
+                        '\t' => print!(">"),
+                        '\x08' => print!("<"),
+                        _ =>
+                            if c < ' ' {
+                                // Formula taken from 2.11BSD ed (see
+                                // https://minnie.tuhs.org//cgi-bin/utree.pl?file=2.11BSD/src/bin/ed.c)
+                                let l1 = (((c as u8) >> 3) + ('0' as u8)) as char;
+                                let l2 = (((c as u8) & 0x7) + ('0' as u8)) as char;
+                                print!("\\{}{}", l1, l2);
+                            } else {
+                                print!("{}", c);
+                            },
+                    }
+                }
+                println!("$");
+            }
+        },
+        None => {},
+    }
+}
+
 // Read a line of commands from the given input, handling lines with
 // trailing backslashes (`\`) by removing them and concatenating them
 // with the following line(s).
@@ -1341,6 +1411,7 @@ fn run_one<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<
                 'm' => move_cmd(state, input, lines),
                 't' => transfer_cmd(state, input, lines),
                 'd' => delete_cmd(state, input, lines),
+                'j' => join_cmd(state, input, lines),
                 'e' => edit_cmd(state, input, lines),
                 'f' => filename_cmd(state, input, lines),
                 'w' => write_cmd(state, input, lines),
@@ -1377,6 +1448,7 @@ fn run<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) 
                 'm' => move_cmd(state, input, lines),
                 't' => transfer_cmd(state, input, lines),
                 'd' => delete_cmd(state, input, lines),
+                'j' => join_cmd(state, input, lines),
                 'e' => edit_cmd(state, input, lines),
                 'f' => filename_cmd(state, input, lines),
                 'w' => write_cmd(state, input, lines),
