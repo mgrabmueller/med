@@ -35,6 +35,7 @@ struct State {
     print_prompt: bool,
     last_pattern: Option<Vec<Pat>>,
     cut_buffer: Option<Vec<String>>,
+    input: Option<Vec<String>>,
 }
 
 impl State {
@@ -49,6 +50,7 @@ impl State {
             print_prompt: false,
             last_pattern: None,
             cut_buffer: None,
+            input: None,
         }
     }
 
@@ -925,21 +927,35 @@ fn save(state: &State, filename: &Option<String>, line1: usize, line2: usize) ->
     }
 }
 
-fn input_mode() -> io::Result<Vec<String>> {
+fn input_mode(state: &mut State) -> io::Result<Vec<String>> {
     let mut lines = Vec::new();
-    let mut buf = String::new();
 
-    let stdin = io::stdin();
-
-    let mut cnt = stdin.read_line(&mut buf)?;
-    while cnt > 0 {
-        if buf == ".\n" {
-            break;
+    if let Some(mut input) = state.input.take() {
+        while input.len() > 0 {
+            let mut buf = input.drain(0..1).next().unwrap();
+            if buf == "." {
+                break;
+            }
+            let _ = buf.pop();
+            lines.push(buf.clone());
         }
-        let _ = buf.pop();
-        lines.push(buf.clone());
-        buf.clear();
-        cnt = stdin.read_line(&mut buf)?;
+        if input.len() > 0 {
+            state.input = Some(input);
+        }
+    } else {
+        let mut buf = String::new();
+        let stdin = io::stdin();
+
+        let mut cnt = stdin.read_line(&mut buf)?;
+        while cnt > 0 {
+            if buf == ".\n" {
+                break;
+            }
+            let _ = buf.pop();
+            lines.push(buf.clone());
+            buf.clear();
+            cnt = stdin.read_line(&mut buf)?;
+        }
     }
     Ok(lines)
 }
@@ -960,7 +976,7 @@ fn append_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 
     // Read lines from stdin until a line with a single period (.) is
     // read.
-    let lines = input_mode()?;
+    let lines = input_mode(state)?;
 
     let line_count = lines.len();
 
@@ -989,7 +1005,7 @@ fn insert_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 
     // Read lines from stdin until a line with a single period (.) is
     // read.
-    let lines = input_mode()?;
+    let lines = input_mode(state)?;
 
     let line_count = lines.len();
 
@@ -1015,7 +1031,7 @@ fn change_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     let pflag = print_flag(input);
     any_arg_err(input)?;
 
-    let lines = input_mode()?;
+    let lines = input_mode(state)?;
 
     state.delete(line1, line2);
 
@@ -1445,22 +1461,34 @@ fn do_print(state: &State, line1: usize, line2: usize, pflag: Option<PrintFlag>)
 fn read_command_line<W: Write, R: BufRead>(state: &mut State, stdin: &mut R, stdout: &mut W) ->
     io::Result<Option<String>>
 {
-    let mut buf = String::new();
-
-    prompt(&state, stdout)?;
-
-    if stdin.read_line(&mut buf)? > 0 {
-        while buf.ends_with("\\\n") {
-            let _ = buf.pop();
-            let _ = buf.pop();
-            buf.push('\n');
-            if stdin.read_line(&mut buf)? == 0 {
-                break;
+    if let Some(mut input) = state.input.take() {
+        if input.len() > 0 {
+            let buf = input.drain(0..1).next().unwrap();
+            if input.len() > 0 {
+                state.input = Some(input);
             }
+            return Ok(Some(buf));
+        } else {
+            Ok(None)
         }
-        return Ok(Some(buf));
     } else {
-        Ok(None)
+        let mut buf = String::new();
+
+        prompt(&state, stdout)?;
+
+        if stdin.read_line(&mut buf)? > 0 {
+            while buf.ends_with("\\\n") {
+                let _ = buf.pop();
+                let _ = buf.pop();
+                buf.push('\n');
+                if stdin.read_line(&mut buf)? == 0 {
+                    break;
+                }
+            }
+            return Ok(Some(buf));
+        } else {
+            Ok(None)
+        }
     }
 }
 
