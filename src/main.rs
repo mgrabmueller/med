@@ -34,6 +34,7 @@ struct State {
     prompt: Option<String>,
     print_prompt: bool,
     last_pattern: Option<Vec<Pat>>,
+    cut_buffer: Option<Vec<String>>,
 }
 
 impl State {
@@ -47,6 +48,7 @@ impl State {
             prompt: Some("*".into()),
             print_prompt: false,
             last_pattern: None,
+            cut_buffer: None,
         }
     }
 
@@ -103,6 +105,17 @@ impl State {
         self.lines.as_slice()[from_line - 1..=to_line - 1].iter().map(| l | l.text.clone()).collect()
     }
 
+    fn yank(&mut self, from_line: usize, to_line: usize) {
+        self.cut_buffer = Some(self.lines.as_slice()[from_line - 1..=to_line - 1].iter().map(| l | l.text.clone()).collect());
+    }
+
+    fn copy_cut_buffer(&self) -> Option<Vec<String>> {
+        match &self.cut_buffer {
+            None => None,
+            Some(v) => Some(v.clone()),
+        }
+    }
+    
     fn last_line(&self) -> usize {
         self.lines.len()
     }
@@ -266,6 +279,26 @@ fn default_lines(l: Lines, line1: usize, line2: usize) -> (usize, usize) {
     match l {
         None => (line1, line2),
         Some((l1, l2)) => (l1, l2),
+    }
+}
+
+// Check the input for an print command (`p`, `n` or `l`) immediately
+// following a command (no leading whitespace allowed).  If found,
+// skip the command character, convert it into a print flag and return
+// it. If not found, return None.  The print flag can then be passed
+// to the `do_print` function in order to conditionally print a range
+// of lines.
+fn print_flag<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> Option<PrintFlag>
+{
+    if let Some(c) = input.current() {
+        match c {
+            'p' => { input.skip(); Some(PrintFlag::Print) },
+            'n' => { input.skip(); Some(PrintFlag::Enumerate) },
+            'l' => { input.skip(); Some(PrintFlag::List) },
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 
@@ -922,6 +955,7 @@ fn append_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 
     // Note that line address 0 is allowed, to insert at the start of
     // the buffer.
+    let pflag = print_flag(input);
     any_arg_err(input)?;
 
     // Read lines from stdin until a line with a single period (.) is
@@ -934,6 +968,7 @@ fn append_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     state.append(insert_line, lines);
 
     state.current_line = insert_line + line_count;
+    do_print(state, state.current_line, state.current_line, pflag);
     Ok(true)
 }
 
@@ -949,6 +984,7 @@ fn insert_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     // Note that line address 0 is allowed, it is equivalent to 1.
     let insert_line = std::cmp::max(insert_line0, 1);
 
+    let pflag = print_flag(input);
     any_arg_err(input)?;
 
     // Read lines from stdin until a line with a single period (.) is
@@ -961,6 +997,7 @@ fn insert_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     state.append(insert_line - 1, lines);
 
     state.current_line = insert_line + line_count - 1;
+    do_print(state, state.current_line, state.current_line, pflag);
     Ok(true)
 }
 
@@ -975,6 +1012,7 @@ fn change_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
+    let pflag = print_flag(input);
     any_arg_err(input)?;
 
     let lines = input_mode()?;
@@ -986,6 +1024,7 @@ fn change_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     state.append(line1 - 1, lines);
 
     state.current_line = line1 + line_count - 1;
+    do_print(state, state.current_line, state.current_line, pflag);
     Ok(true)
 }
 
@@ -1003,6 +1042,7 @@ fn move_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
         }
 
         zero_address_err(line1)?;
+        let pflag = print_flag(input);
         any_arg_err(input)?;
 
         let lines = state.take(line1, line2);
@@ -1012,6 +1052,7 @@ fn move_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
         state.append(to_line, lines);
 
         state.current_line = to_line + line_count;
+        do_print(state, state.current_line, state.current_line, pflag);
         Ok(true)
     } else {
         return missing_address_err();
@@ -1029,6 +1070,7 @@ fn transfer_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut I
     if let Some(to_line) = get_line_number(state, input)? {
 
         zero_address_err(line1)?;
+        let pflag = print_flag(input);
         any_arg_err(input)?;
 
         let lines = state.copy(line1, line2);
@@ -1038,6 +1080,7 @@ fn transfer_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut I
         state.append(to_line, lines);
 
         state.current_line = to_line + line_count;
+        do_print(state, state.current_line, state.current_line, pflag);
         Ok(true)
     } else {
         return missing_address_err();
@@ -1053,26 +1096,14 @@ fn delete_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
+    let pflag = print_flag(input);
     any_arg_err(input)?;
 
     state.delete(line1, line2);
 
     state.current_line = std::cmp::min(state.last_line(), line1);
+    do_print(state, state.current_line, state.current_line, pflag);
     Ok(true)
-}
-
-fn print_flag<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> Option<PrintFlag>
-{
-    if let Some(c) = input.current() {
-        match c {
-            'p' => { input.skip(); Some(PrintFlag::Print) },
-            'n' => { input.skip(); Some(PrintFlag::Enumerate) },
-            'l' => { input.skip(); Some(PrintFlag::List) },
-            _ => None,
-        }
-    } else {
-        None
-    }
 }
 
 // Join command (j). Join all lines in the given range, or if only one
@@ -1104,6 +1135,48 @@ fn join_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
     do_print(state, line1, line1, pflag);
     
     state.current_line = line1;
+    Ok(true)
+}
+
+// Copy command (x). Insert contents of the cut buffer after the
+// addressed line.  The current address is set to the last line
+// copied.
+fn copy_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    let (line1, line2) = default_lines(l, state.current_line, state.current_line);
+
+    zero_address_err(line1)?;
+    let pflag = print_flag(input);
+    any_arg_err(input)?;
+
+
+    if let Some(lines) = state.copy_cut_buffer() {
+        let line_cnt = lines.len();
+
+        state.append(line2, lines);
+
+        state.current_line = line2 + line_cnt;
+    
+        do_print(state, state.current_line, state.current_line, pflag);
+        Ok(true)
+    } else {
+        err(io::ErrorKind::InvalidData, "cut buffer empty")
+    }
+}
+
+// Yank command (y). Copy (yank) the addressed lines to the cut
+// buffer.  The current addres is not changed.
+fn yank_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
+    io::Result<bool>
+{
+    let (line1, line2) = default_lines(l, state.current_line, state.current_line);
+
+    zero_address_err(line1)?;
+    any_arg_err(input)?;
+
+    state.yank(line1, line2);
+
     Ok(true)
 }
 
@@ -1417,6 +1490,8 @@ fn run_one<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<
                 'w' => write_cmd(state, input, lines),
                 'r' => read_cmd(state, input, lines),
                 'k' => mark_cmd(state, input, lines),
+                'x' => copy_cmd(state, input, lines),
+                'y' => yank_cmd(state, input, lines),
                 '=' => print_line_cmd(state, input, lines),
                 '\n' => empty_cmd(state, input, lines),
                 _   => {
@@ -1457,6 +1532,8 @@ fn run<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) 
                 'v' => vlobal_cmd(state, input, lines),
                 'P' => prompt_cmd(state, input, lines),
                 'k' => mark_cmd(state, input, lines),
+                'x' => copy_cmd(state, input, lines),
+                'y' => yank_cmd(state, input, lines),
                 '=' => print_line_cmd(state, input, lines),
                 '\n' => empty_cmd(state, input, lines),
                 _   => {
