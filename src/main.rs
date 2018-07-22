@@ -3,6 +3,11 @@ use std::fs::{File};
 
 type Lines = Option<(usize, usize)>;
 
+enum Mode {
+    Command,
+    Input,
+}
+
 enum PrintFlag {
     Print,
     Enumerate,
@@ -26,6 +31,7 @@ impl Line {
 }
 
 struct State {
+    mode: Mode,
     default_filename: Option<String>,
     lines: Vec<Line>,
     current_line: usize,
@@ -35,12 +41,16 @@ struct State {
     print_prompt: bool,
     last_pattern: Option<Vec<Pat>>,
     cut_buffer: Option<Vec<String>>,
-    input: Option<Vec<String>>,
+    input_lines: Vec<String>,
+    input_line: Vec<char>,
+    input_p: usize,
+    exec_global: bool,
 }
 
 impl State {
     fn new() -> Self {
         State{
+            mode: Mode::Command,
             default_filename: None,
             lines: Vec::new(),
             current_line: 0,
@@ -50,7 +60,10 @@ impl State {
             print_prompt: false,
             last_pattern: None,
             cut_buffer: None,
-            input: None,
+            input_lines: Vec::new(),
+            input_line: Vec::new(),
+            input_p: 0,
+            exec_global: false,
         }
     }
 
@@ -108,7 +121,8 @@ impl State {
     }
 
     fn yank(&mut self, from_line: usize, to_line: usize) {
-        self.cut_buffer = Some(self.lines.as_slice()[from_line - 1..=to_line - 1].iter().map(| l | l.text.clone()).collect());
+        self.cut_buffer = Some(self.lines.as_slice()[from_line - 1..=to_line - 1].iter()
+                               .map(| l | l.text.clone()).collect());
     }
 
     fn copy_cut_buffer(&self) -> Option<Vec<String>> {
@@ -117,7 +131,7 @@ impl State {
             Some(v) => Some(v.clone()),
         }
     }
-    
+
     fn last_line(&self) -> usize {
         self.lines.len()
     }
@@ -129,65 +143,125 @@ impl State {
         }
     }
 
-}
+    fn read_line(&mut self) -> io::Result<Option<String>> {
+        if self.input_lines.is_empty() && !self.exec_global {
+            let stdin = io::stdin();
+            let mut stdout = io::stdout();
 
-struct Input<I: Iterator<Item=char>> {
-    iter: I,
-    lookahead: Option<char>,
-    iter_save: Vec<I>,
-    lookahead_save: Vec<Option<char>>,
-}
+            prompt(self, &mut stdout)?;
 
-impl<I: Iterator<Item=char> + Clone> Input<I> {
-    fn new(mut iter: I) -> Self {
-        let c = iter.next();
-        Input{
-            iter: iter,
-            lookahead: c,
-            iter_save: Vec::new(),
-            lookahead_save: Vec::new(),
-        }
-    }
-
-    fn save(&mut self) {
-        self.iter_save.push(self.iter.clone());
-        self.lookahead_save.push(self.lookahead);
-    }
-
-    fn restore(&mut self) {
-        self.iter = self.iter_save.pop().expect("impossible");
-        self.lookahead = self.lookahead_save.pop().expect("impossible");
-    }
-
-    fn current(&mut self) -> Option<char> {
-        self.lookahead
-    }
-
-    fn skip(&mut self) {
-        self.lookahead = self.iter.next();
-    }
-
-    fn skip_ws(&mut self) {
-        while let Some(c) = self.current() {
-            if c == ' ' || c == '\t' {
-                self.skip();
+            let mut buf = String::new();
+            let mut cnt = stdin.read_line(&mut buf)?;
+            if cnt > 0 {
+                while buf.ends_with("\\\n") {
+                    let _ = buf.pop();
+                    let _ = buf.pop();
+                    buf.push('\n');
+                    cnt = stdin.read_line(&mut buf)?;
+                    if cnt == 0 {
+                        break;
+                    }
+                }
             } else {
-                return;
+                return Ok(None);
+            }
+            return Ok(Some(buf));
+        } else {
+            if self.input_lines.is_empty() {
+                Ok(None)
+            } else {
+                let buf = self.input_lines.remove(0);
+                Ok(Some(buf))
             }
         }
     }
 
-    fn skip_all_ws(&mut self) {
-        while let Some(c) = self.current() {
-            if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-                self.skip();
-            } else {
-                return;
-            }
+    fn drop_char(&mut self) -> io::Result<()> {
+        self.input_p += 1;
+        Ok(())
+    }
+
+    fn eol(&self) -> bool {
+        if self.input_p < self.input_line.len() {
+            self.input_line[self.input_p] == '\n'
+        } else {
+            true
         }
     }
-}
+    // Return the current input character, or None if at the end of
+    // input.
+    fn current_char(&mut self) -> io::Result<Option<char>> {
+        if self.input_p >= self.input_line.len() {
+            if let Some(s) = self.read_line()? {
+                self.input_line = s.chars().collect();
+                self.input_p = 0;
+            } else {
+                return Ok(None);
+            }
+        }
+        let c = self.input_line[self.input_p];
+        Ok(Some(c))
+    }
 
+    // Skip all horizontal whitespace (if any).
+    fn skip_ws(&mut self) -> io::Result<()> {
+        while self.input_p < self.input_line.len() {
+            match self.input_line[self.input_p] {
+                ' ' => {},
+                '\t' => {},
+                _ => break,
+            }
+            self.skip_char()?;
+        }
+        Ok(())
+    }
+
+    // Skip all characters up to and including the newline '\n'
+    // character.
+    fn skip_to_nl(&mut self) -> io::Result<()> {
+        while let Some(c) = self.current_char()? {
+            match c {
+                '\n' => {
+                    self.skip_char()?;
+                    break;
+                },
+                _ => {
+                    self.skip_char()?;
+                },
+            }
+        }
+        Ok(())
+    }
+
+    // Skip the current input char (if any).
+    fn skip_char(&mut self) -> io::Result<()> {
+        if self.input_p >= self.input_line.len() {
+            if let Some(s) = self.read_line()? {
+                self.input_line = s.chars().collect();
+                self.input_p = 0;
+            } else {
+                return Ok(());
+            }
+        }
+        self.input_p += 1;
+        Ok(())
+
+    }
+
+    // Return all characters until the end of the current input line.
+    fn take_to_end(&mut self) -> io::Result<String> {
+        let mut buf = String::new();
+        while let Some(c) = self.current_char()? {
+            buf.push(c);
+            self.skip_char()?;
+        }
+        Ok(buf)
+    }
+
+    fn append_input_lines(&mut self, l: Vec<String>) {
+        self.input_lines.extend(l);
+    }
+}
 
 // Construct an IO error of the given kind and error message.
 fn err<R>(kind: io::ErrorKind, msg: &str) -> io::Result<R> {
@@ -222,13 +296,18 @@ fn invalid_pattern_err<R>() -> io::Result<R> {
 // Return an error value if the given input contains any remaining
 // non-whitespace characters.  Will also ignore newlines and carriage
 // returns.
-fn any_arg_err<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<()> {
-    input.skip_ws();
-    match input.current() {
+fn any_arg_err(state: &mut State) -> io::Result<()> {
+    state.skip_ws()?;
+    match state.current_char()? {
         None => Ok(()),
-        Some('\n') => Ok(()),
-        Some(_) =>
+        Some('\n') => {
+            state.drop_char()?;
+            Ok(())
+        },
+        Some(_) => {
+            state.skip_to_nl()?;
             err(io::ErrorKind::InvalidData, "no parameters allowed")
+        },
     }
 }
 
@@ -255,16 +334,18 @@ fn any_address_err(l: Lines) -> io::Result<()> {
 // Write a prompt to stdout (without a newline) and flush it to the
 // terminal.
 fn prompt<W: Write>(state: &State, stdout: &mut W) -> io::Result<()> {
-    if state.print_prompt {
-        match &state.prompt {
-            None => {
-                return err(io::ErrorKind::Other, "no prompt set");
+    match (&state.mode, state.print_prompt) {
+        (Mode::Command, true) =>
+            match &state.prompt {
+                None => {
+                    return err(io::ErrorKind::Other, "no prompt set");
+                },
+                Some(p) => {
+                    print!("{}", p);
+                    stdout.flush()?
+                },
             },
-            Some(p) => {
-                print!("{}", p);
-                stdout.flush()?
-            },
-        }
+        _ => {},
     }
     Ok(())
 }
@@ -290,17 +371,21 @@ fn default_lines(l: Lines, line1: usize, line2: usize) -> (usize, usize) {
 // it. If not found, return None.  The print flag can then be passed
 // to the `do_print` function in order to conditionally print a range
 // of lines.
-fn print_flag<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> Option<PrintFlag>
+fn print_flag(state: &mut State) -> io::Result<Option<PrintFlag>>
 {
-    if let Some(c) = input.current() {
-        match c {
-            'p' => { input.skip(); Some(PrintFlag::Print) },
-            'n' => { input.skip(); Some(PrintFlag::Enumerate) },
-            'l' => { input.skip(); Some(PrintFlag::List) },
-            _ => None,
+    if !state.eol() {
+        if let Some(c) = state.current_char()? {
+            match c {
+                'p' => { state.skip_char()?; Ok(Some(PrintFlag::Print)) },
+                'n' => { state.skip_char()?; Ok(Some(PrintFlag::Enumerate)) },
+                'l' => { state.skip_char()?; Ok(Some(PrintFlag::List)) },
+                _ => Ok(None),
+            }
+        } else {
+            Ok(None)
         }
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -308,14 +393,14 @@ fn print_flag<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> Option<Pr
 // `c`, which must be in the range '0'..'9' (inclusive).  Will stop as
 // soon as a non-numeric character is found (or a the end of input).
 // Returns the result wrapped in a `io::Result` for convenience.
-fn get_num<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, c: char) -> io::Result<usize> {
+fn get_num(state: &mut State, c: char) -> io::Result<usize> {
     let mut acc = atoi(c);
-    input.skip();
-    while let Some(c) = input.current() {
+    state.skip_char()?;
+    while let Some(c) = state.current_char()? {
         match c {
             '0'..='9' => {
                 acc = acc * 10 + atoi(c);
-                input.skip();
+                state.skip_char()?;
             },
             _ => {
                 break;
@@ -370,11 +455,9 @@ fn dec_mod_line(l: usize, last: usize) -> usize {
 // Get the line address matching the pattern at the current input
 // position, which starts with character `scan_char` (either `/` or
 // `?`).
-fn get_scan_pattern<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>,
-                                                    scan_char: char) ->
-    io::Result<usize>
+fn get_scan_pattern(state: &mut State, scan_char: char) -> io::Result<usize>
 {
-    let pat = get_pattern(input)?;
+    let pat = get_pattern(state)?;
     let search_pat =
         if pat.len() == 0 {
             match &state.last_pattern {
@@ -451,26 +534,25 @@ fn get_scan_pattern<I: Iterator<Item=char> + Clone>(state: &mut State, input: &m
 // $+
 // $-
 //
-fn get_line_number<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) ->
-    io::Result<Option<usize>>
+fn get_line_number(state: &mut State) -> io::Result<Option<usize>>
 {
-    input.skip_ws();
-    if let Some(c) = input.current() {
+    state.skip_ws()?;
+    if let Some(c) = state.current_char()? {
         let term1 =
             match c {
                 '.' => {
-                    input.skip();
+                    state.skip_char()?;
                     state.current_line
                 },
                 '$' => {
-                    input.skip();
+                    state.skip_char()?;
                     state.last_line()
                 },
                 '\'' => {
-                    input.skip();
-                    if let Some(c) = input.current() {
+                    state.skip_char()?;
+                    if let Some(c) = state.current_char()? {
                         if c >= 'a' && c <= 'z' {
-                            input.skip();
+                            state.skip_char()?;
 
                             let mut l = 0;
                             for i in 1 ..= state.last_line() {
@@ -493,19 +575,19 @@ fn get_line_number<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mu
                         return err(io::ErrorKind::InvalidData, "invalid mark name");
                     }
                 },
-                '/' => get_scan_pattern(state, input, c)?,
-                '?' => get_scan_pattern(state, input, c)?,
+                '/' => get_scan_pattern(state, c)?,
+                '?' => get_scan_pattern(state, c)?,
                 '0'..='9' => {
-                    let acc = get_num(input, c)?;
+                    let acc = get_num(state, c)?;
                     acc
                 },
                 '+' | '-' => {
                     let sign = c;
-                    input.skip();
-                    if let Some(c) = input.current() {
+                    state.skip_char()?;
+                    if let Some(c) = state.current_char()? {
                         match c {
                             '0'..='9' => {
-                                let acc = get_num(input, c)?;
+                                let acc = get_num(state, c)?;
                                 return get_rel_line(state, sign, state.current_line, acc)
                             },
                             _ => return get_rel_line(state, sign, state.current_line, 1)
@@ -518,16 +600,16 @@ fn get_line_number<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mu
                     return Ok(None)
                 }
             };
-        input.skip_ws();
-        if let Some(c) = input.current() {
+        state.skip_ws()?;
+        if let Some(c) = state.current_char()? {
             if c == '+' || c == '-' {
                 let sign = c;
-                input.skip();
+                state.skip_char()?;
                 let increment =
-                    if let Some(c) = input.current() {
+                    if let Some(c) = state.current_char()? {
                         match c {
                             '0'..='9' => {
-                                get_num(input, c)?
+                                get_num(state, c)?
                             },
                             _ => 1
                         }
@@ -547,12 +629,11 @@ fn get_line_number<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mu
    }
 }
 
-fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) ->
-    io::Result<Lines>
+fn get_lines(state: &mut State) -> io::Result<Lines>
 {
 
     // Get optional first line address.
-    let line1 = get_line_number(state, input)?;
+    let line1 = get_line_number(state)?;
 
     // Do some bounds checking here so we don't have to repeat it
     // below for different cases.
@@ -563,10 +644,10 @@ fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
     }
 
     // Now check for second line address.
-    input.skip_ws();
-    if let Some(c) = input.current() {
+    state.skip_ws()?;
+    if let Some(c) = state.current_char()? {
         if c == ',' || c == ';' {
-            input.skip();
+            state.skip_char()?;
 
             if c == ';' {
                 if let Some(l1) = line1 {
@@ -575,7 +656,7 @@ fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
             }
 
             // Get optional second line address.
-            let line2 = get_line_number(state, input)?;
+            let line2 = get_line_number(state)?;
 
             // Now fill in defaults.  If second address is given, we
             // check its bounds.
@@ -608,17 +689,17 @@ fn get_lines<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
     }
 }
 
-fn get_argument<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<Option<String>> {
-    input.skip_ws();
-    if input.current().is_some() {
+fn get_argument(state: &mut State) -> io::Result<Option<String>> {
+    state.skip_ws()?;
+    if state.current_char()?.is_some() {
         let mut arg = String::new();
         loop {
-            if let Some(c) = input.current() {
+            if let Some(c) = state.current_char()? {
                 if c == '\n' {
                     break;
                 }
                 arg.push(c);
-                input.skip();
+                state.skip_char()?;
             } else {
                 break;
             }
@@ -633,12 +714,12 @@ fn get_argument<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Res
     }
 }
 
-fn get_char_class<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<String> {
+fn get_char_class(state: &mut State) -> io::Result<String> {
     let mut class = String::new();
-    while let Some(c) = input.current() {
+    while let Some(c) = state.current_char()? {
         match c {
             ']' => {
-                input.skip();
+                state.skip_char()?;
                 if class.len() == 0 {
                     class.push(c);
                 } else {
@@ -646,7 +727,7 @@ fn get_char_class<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::R
                 }
             },
             '-' => {
-                input.skip();
+                state.skip_char()?;
                 if class.len() == 0 {
                     class.push(c);
                 } else {
@@ -657,7 +738,7 @@ fn get_char_class<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::R
                 break;
             },
             _ => {
-                input.skip();
+                state.skip_char()?;
                 class.push(c);
             },
         }
@@ -728,33 +809,32 @@ fn match_pattern(cpat: &Vec<Pat>, target0: &str) -> Option<usize> {
     None
 }
 
-fn get_atomic_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) ->
-    io::Result<Pat>
+fn get_atomic_pattern(state: &mut State) -> io::Result<Pat>
 {
-    if let Some(c) = input.current() {
+    if let Some(c) = state.current_char()? {
         if c == '\\' {
-            input.skip();
-            if let Some(c) = input.current() {
-                input.skip();
+            state.skip_char()?;
+            if let Some(c) = state.current_char()? {
+                state.skip_char()?;
                 Ok(Pat::Char(c))
             } else {
                 invalid_pattern_err()
             }
         } else if c == '[' {
-            input.skip();
-            let class = get_char_class(input)?;
+            state.skip_char()?;
+            let class = get_char_class(state)?;
             Ok(Pat::Class(class))
         } else if c == '.' {
-            input.skip();
+            state.skip_char()?;
             Ok(Pat::Any)
         } else if c == '^' {
-            input.skip();
+            state.skip_char()?;
             Ok(Pat::Bol)
         } else if c == '$' {
-            input.skip();
+            state.skip_char()?;
             Ok(Pat::Eol)
         } else {
-            input.skip();
+            state.skip_char()?;
             Ok(Pat::Char(c))
         }
     } else {
@@ -762,12 +842,11 @@ fn get_atomic_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) ->
     }
 }
 
-fn get_pattern1<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, delim: char) ->
-    io::Result<Vec<Pat>>
+fn get_pattern1(state: &mut State, delim: char) -> io::Result<Vec<Pat>>
 {
     let mut pattern = Vec::new();
 
-    while let Some(c) = input.current() {
+    while let Some(c) = state.current_char()? {
         if c == delim {
             break;
         } else if c == '\n' {
@@ -777,10 +856,10 @@ fn get_pattern1<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, delim: cha
         } else if c == '|' {
             break;
         } else {
-            let mut sub_pat = get_atomic_pattern(input)?;
-            if let Some(c) = input.current() {
+            let mut sub_pat = get_atomic_pattern(state)?;
+            if let Some(c) = state.current_char()? {
                 if c == '*' {
-                    input.skip();
+                    state.skip_char()?;
                     sub_pat = Pat::Star(Box::new(sub_pat));
                 }
             }
@@ -790,15 +869,15 @@ fn get_pattern1<I: Iterator<Item=char> + Clone>(input: &mut Input<I>, delim: cha
     Ok(pattern)
 }
 
-fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Result<Vec<Pat>> {
-    input.skip_ws();
+fn get_pattern(state: &mut State) -> io::Result<Vec<Pat>> {
+    state.skip_ws()?;
 
-    if let Some(c) = input.current() {
+    if let Some(c) = state.current_char()? {
         let delim = c;
 
-        input.skip();
+        state.skip_char()?;
 
-        let pat = get_pattern1(input, delim)?;
+        let pat = get_pattern1(state, delim)?;
 
         for (i, p) in pat.iter().enumerate() {
             match p {
@@ -816,9 +895,9 @@ fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Resu
 
         // The closing delimiter is optional and will be skipped, if
         // present.
-        if let Some(c) = input.current() {
+        if let Some(c) = state.current_char()? {
             if c == delim {
-                input.skip();
+                state.skip_char()?;
             }
         }
         Ok(pat)
@@ -829,11 +908,10 @@ fn get_pattern<I: Iterator<Item=char> + Clone>(input: &mut Input<I>) -> io::Resu
 
 // Quit command (q).  Ensures that no line addresses and no parameters
 // are given and returns false, which will terminate the main loop.
-fn quit_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn quit_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     any_address_err(l)?;
-    any_arg_err(input)?;
+    any_arg_err(state)?;
 
     if state.modified && state.last_command != Some('q') {
         return err(io::ErrorKind::Other, "buffer modified")
@@ -847,16 +925,15 @@ fn quit_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 // than zero and that no parameters are given.  Then prints all lines
 // in the line range to the terminal and set the current line to the
 // last line printed.
-fn print_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn print_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_arg_err(input)?;
+    any_arg_err(state)?;
 
     do_print(state, line1, line2, Some(PrintFlag::Print));
-    
+
     state.current_line = line2;
     Ok(true)
 }
@@ -865,13 +942,12 @@ fn print_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
 // end of each line, a dollar ($) character is printed.  All dollar
 // characters that appear on lines are prefixed with a backslash (\)
 // character.
-fn list_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn list_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_arg_err(input)?;
+    any_arg_err(state)?;
 
     do_print(state, line1, line2, Some(PrintFlag::List));
 
@@ -881,13 +957,12 @@ fn list_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 
 // Enumerate command (n). Print each line in the address range,
 // prefixing each line with it's line number.
-fn enum_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn enum_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_arg_err(input)?;
+    any_arg_err(state)?;
 
     do_print(state, line1, line2, Some(PrintFlag::Enumerate));
 
@@ -928,34 +1003,15 @@ fn save(state: &State, filename: &Option<String>, line1: usize, line2: usize) ->
 }
 
 fn input_mode(state: &mut State) -> io::Result<Vec<String>> {
+    state.mode = Mode::Input;
     let mut lines = Vec::new();
 
-    if let Some(mut input) = state.input.take() {
-        while input.len() > 0 {
-            let mut buf = input.drain(0..1).next().unwrap();
-            if buf == "." {
-                break;
-            }
-            let _ = buf.pop();
-            lines.push(buf.clone());
+    while let Some(mut s) = state.read_line()? {
+        if s == ".\n" {
+            break;
         }
-        if input.len() > 0 {
-            state.input = Some(input);
-        }
-    } else {
-        let mut buf = String::new();
-        let stdin = io::stdin();
-
-        let mut cnt = stdin.read_line(&mut buf)?;
-        while cnt > 0 {
-            if buf == ".\n" {
-                break;
-            }
-            let _ = buf.pop();
-            lines.push(buf.clone());
-            buf.clear();
-            cnt = stdin.read_line(&mut buf)?;
-        }
+        let _ = s.pop();
+        lines.push(s.clone());
     }
     Ok(lines)
 }
@@ -964,15 +1020,14 @@ fn input_mode(state: &mut State) -> io::Result<Vec<String>> {
 // with a single period (.) is read.  The line terminating input is
 // discarded.  The other lines are inserted into the buffer after the
 // addressed line.  The current line is set to the last line inserted.
-fn append_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn append_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (_line1, insert_line) = default_lines(l, state.current_line, state.current_line);
 
     // Note that line address 0 is allowed, to insert at the start of
     // the buffer.
-    let pflag = print_flag(input);
-    any_arg_err(input)?;
+    let pflag = print_flag(state)?;
+    any_arg_err(state)?;
 
     // Read lines from stdin until a line with a single period (.) is
     // read.
@@ -992,16 +1047,15 @@ fn append_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 // with a single period (.) is read.  The line terminating input is
 // discarded.  The other lines are inserted into the buffer before the
 // addressed line.  The current line is set to the last line inserted.
-fn insert_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn insert_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (_line1, insert_line0) = default_lines(l, state.current_line, state.current_line);
 
     // Note that line address 0 is allowed, it is equivalent to 1.
     let insert_line = std::cmp::max(insert_line0, 1);
 
-    let pflag = print_flag(input);
-    any_arg_err(input)?;
+    let pflag = print_flag(state)?;
+    any_arg_err(state)?;
 
     // Read lines from stdin until a line with a single period (.) is
     // read.
@@ -1022,14 +1076,13 @@ fn insert_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 // discarded.  The addresses lines are removed from the buffer and the
 // newly read lines are inserted in their place.  The current line is
 // set to the last line inserted.
-fn change_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn change_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    let pflag = print_flag(input);
-    any_arg_err(input)?;
+    let pflag = print_flag(state)?;
+    any_arg_err(state)?;
 
     let lines = input_mode(state)?;
 
@@ -1046,20 +1099,19 @@ fn change_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 
 // Move command (m). Move the addressed lines after the line given as
 // an argument. The current line is set to the last line moved.
-fn move_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn move_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
-    if let Some(mut to_line) = get_line_number(state, input)? {
+    if let Some(mut to_line) = get_line_number(state)? {
 
         if to_line >= line1 {
             to_line -= (line2 - line1) + 1;
         }
 
         zero_address_err(line1)?;
-        let pflag = print_flag(input);
-        any_arg_err(input)?;
+        let pflag = print_flag(state)?;
+        any_arg_err(state)?;
 
         let lines = state.take(line1, line2);
 
@@ -1078,16 +1130,15 @@ fn move_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 // Transfer command (t). Copy the addressed lines and insert them
 // after the line given as an argument.  Set the current line to the
 // last line copied.
-fn transfer_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn transfer_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
-    if let Some(to_line) = get_line_number(state, input)? {
+    if let Some(to_line) = get_line_number(state)? {
 
         zero_address_err(line1)?;
-        let pflag = print_flag(input);
-        any_arg_err(input)?;
+        let pflag = print_flag(state)?;
+        any_arg_err(state)?;
 
         let lines = state.copy(line1, line2);
 
@@ -1106,14 +1157,13 @@ fn transfer_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut I
 // Delete command (d).  Remove the addressed line from the buffer.
 // Set the current line to the line after the deleted lines, if it
 // exists and to the line before otherwise.
-fn delete_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn delete_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    let pflag = print_flag(input);
-    any_arg_err(input)?;
+    let pflag = print_flag(state)?;
+    any_arg_err(state)?;
 
     state.delete(line1, line2);
 
@@ -1124,14 +1174,13 @@ fn delete_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 
 // Join command (j). Join all lines in the given range, or if only one
 // line is given, join that line with the following one.
-fn join_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn join_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, mut line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    let pflag = print_flag(input);
-    any_arg_err(input)?;
+    let pflag = print_flag(state)?;
+    any_arg_err(state)?;
 
     if line1 == line2 {
         if line1 == state.last_line() {
@@ -1149,7 +1198,7 @@ fn join_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
     state.append(line1 - 1, vec![new_line]);
 
     do_print(state, line1, line1, pflag);
-    
+
     state.current_line = line1;
     Ok(true)
 }
@@ -1157,14 +1206,13 @@ fn join_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 // Copy command (x). Insert contents of the cut buffer after the
 // addressed line.  The current address is set to the last line
 // copied.
-fn copy_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn copy_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    let pflag = print_flag(input);
-    any_arg_err(input)?;
+    let pflag = print_flag(state)?;
+    any_arg_err(state)?;
 
 
     if let Some(lines) = state.copy_cut_buffer() {
@@ -1173,7 +1221,7 @@ fn copy_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
         state.append(line2, lines);
 
         state.current_line = line2 + line_cnt;
-    
+
         do_print(state, state.current_line, state.current_line, pflag);
         Ok(true)
     } else {
@@ -1183,13 +1231,12 @@ fn copy_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 
 // Yank command (y). Copy (yank) the addressed lines to the cut
 // buffer.  The current addres is not changed.
-fn yank_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn yank_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
-    any_arg_err(input)?;
+    any_arg_err(state)?;
 
     state.yank(line1, line2);
 
@@ -1201,8 +1248,7 @@ fn yank_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 // argument is given) and reads it into the edit buffer.  If the
 // buffer is modified, an error is returned.  If a filename is given,
 // it is used as the new default filename.
-fn edit_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn edit_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     any_address_err(l)?;
 
@@ -1210,7 +1256,7 @@ fn edit_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
         return err(io::ErrorKind::Other, "buffer modified")
     }
 
-    let fname = get_argument(input)?.or(state.default_filename.clone());
+    let fname = get_argument(state)?.or(state.default_filename.clone());
 
     let (size, lines) = load(&fname)?;
     state.set_lines(lines);
@@ -1225,12 +1271,11 @@ fn edit_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 // argument is given) and inserts it into the edit buffer at the given
 // line (or current line, if no line is given).  The default filename
 // is unchanged.
-fn read_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn read_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (_line1, line2) = default_lines(l, state.last_line(), state.last_line());
 
-    let fname = get_argument(input)?.or(state.default_filename.clone());
+    let fname = get_argument(state)?.or(state.default_filename.clone());
 
     let (size, lines) = load(&fname)?;
     state.insert_lines(line2, lines);
@@ -1243,12 +1288,11 @@ fn read_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 // default filename or return an error if no default filename is
 // present. If an argument is given, set the default filename to the
 // argument.
-fn filename_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn filename_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     any_address_err(l)?;
 
-    let fname = get_argument(input)?;
+    let fname = get_argument(state)?;
     match fname {
         None =>
             match &state.default_filename {
@@ -1268,12 +1312,11 @@ fn filename_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut I
 // the addressed lines (or the complete buffer contents if no lines
 // are specified) to the given file (or the default filename if none
 // is given) and mark the buffer as unmodified.
-fn write_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn write_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, 1, state.last_line());
 
-    let fname = get_argument(input)?.or(state.default_filename.clone());
+    let fname = get_argument(state)?.or(state.default_filename.clone());
 
     let size = save(state, &fname, line1, line2)?;
     state.modified = false;
@@ -1284,12 +1327,11 @@ fn write_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inpu
 
 // Prompt command (P).  Set the prompt to the given argument if given
 // or toggle prompt printing otherwise.
-fn prompt_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn prompt_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     any_address_err(l)?;
 
-    let new_prompt = get_argument(input)?;
+    let new_prompt = get_argument(state)?;
     match new_prompt {
         None =>
             state.print_prompt = !state.print_prompt,
@@ -1301,13 +1343,11 @@ fn prompt_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Inp
 }
 
 // Work horse for the g and v commands.
-fn global_execute<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>,
-                                                  l: Lines, include: bool) ->
-    io::Result<bool>
+fn global_execute(state: &mut State, l: Lines, include: bool) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, 1, state.last_line());
 
-    let pat = get_pattern(input)?;
+    let pat = get_pattern(state)?;
 
     state.unmark();
 
@@ -1320,7 +1360,10 @@ fn global_execute<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut
         }
     }
 
-    input.skip_all_ws();
+    state.exec_global = true;
+
+    let in_line = state.take_to_end()?;
+    let cmd: Vec<_> = in_line.lines().collect();
 
     // No for loop here, because lines can be added or deleted by the
     // executed commands.
@@ -1329,40 +1372,43 @@ fn global_execute<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut
         if state.lines[line - 1].mark {
             state.current_line = line;
 
-            input.save();
-            run_one(state, input)?;
-            input.restore();
+            state.append_input_lines(cmd.iter().map(|x|
+                                                    {
+                                                        let mut s = x.to_string();
+                                                        s.push('\n');
+                                                        s
+                                                    }).collect());
+            run_one(state)?;
+            state.input_lines.clear();
         }
         line += 1;
     }
+    state.exec_global = false;
     Ok(true)
 }
 
 // Global command (g).  Mark a set of lines matching the argument and
 // then execute the following commands on all of the marked lines.
-fn global_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn global_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
-    global_execute(state, input, l, true)
+    global_execute(state, l, true)
 }
 
 // Global exclusion command (v).  Mark a set of lines NOT matching the
 // argument and then execute the following commands on all of the
 // marked lines.
-fn vlobal_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn vlobal_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
-    global_execute(state, input, l, false)
+    global_execute(state, l, false)
 }
 
 // Mark command (k).  Marks the addressed line with the letter given
 // as an argument.
-fn mark_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn mark_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (_line1, line2) = default_lines(l, state.current_line, state.current_line);
 
-    let arg = get_argument(input)?;
+    let arg = get_argument(state)?;
     match arg {
         None =>
             return missing_argument_err(),
@@ -1380,13 +1426,11 @@ fn mark_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input
 // Print line command (=).  Defaults lines to the last line and
 // verifies that no parameters are given.  Then prints the number of
 // the last line address.
-fn print_line_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>,
-                                                  l: Lines) ->
-    io::Result<bool>
+fn print_line_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
     let (_line1, line2) = default_lines(l, state.last_line(), state.last_line());
 
-    any_arg_err(input)?;
+    any_arg_err(state)?;
 
     println!("{}", line2);
     Ok(true)
@@ -1396,20 +1440,19 @@ fn print_line_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut
 // are given, it sets the current line to the last line, otherwise, it
 // prints the current line and increments the current line number,
 // wrapping around to the first line if necessary.
-fn empty_cmd<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>, l: Lines) ->
-    io::Result<bool>
+fn empty_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 {
-    any_arg_err(input)?;
+    any_arg_err(state)?;
 
     match l {
         None => {
             state.next_line();
-            print_cmd(state, input, None)?;
+            print_cmd(state, None)?;
             Ok(true)
         },
         Some((_l1, l2)) => {
             state.current_line = l2;
-            print_cmd(state, input, None)?;
+            print_cmd(state, None)?;
             Ok(true)
         },
     }
@@ -1455,115 +1498,79 @@ fn do_print(state: &State, line1: usize, line2: usize, pflag: Option<PrintFlag>)
     }
 }
 
-// Read a line of commands from the given input, handling lines with
-// trailing backslashes (`\`) by removing them and concatenating them
-// with the following line(s).
-fn read_command_line<W: Write, R: BufRead>(state: &mut State, stdin: &mut R, stdout: &mut W) ->
-    io::Result<Option<String>>
+fn run_one(state: &mut State) -> io::Result<bool>
 {
-    if let Some(mut input) = state.input.take() {
-        if input.len() > 0 {
-            let buf = input.drain(0..1).next().unwrap();
-            if input.len() > 0 {
-                state.input = Some(input);
-            }
-            return Ok(Some(buf));
-        } else {
-            Ok(None)
-        }
-    } else {
-        let mut buf = String::new();
+    state.mode = Mode::Command;
+    let lines = get_lines(state)?;
+    state.skip_ws()?;
 
-        prompt(&state, stdout)?;
-
-        if stdin.read_line(&mut buf)? > 0 {
-            while buf.ends_with("\\\n") {
-                let _ = buf.pop();
-                let _ = buf.pop();
-                buf.push('\n');
-                if stdin.read_line(&mut buf)? == 0 {
-                    break;
-                }
-            }
-            return Ok(Some(buf));
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-fn run_one<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) ->
-    io::Result<bool>
-{
-    let lines = get_lines(state, input)?;
-    input.skip_ws();
-
-    if let Some(c) = input.current() {
-        input.skip();
+    if let Some(c) = state.current_char()? {
+        state.skip_char()?;
         let result =
             match c {
-                'q' => quit_cmd(state, input, lines),
-                'p' => print_cmd(state, input, lines),
-                'l' => list_cmd(state, input, lines),
-                'n' => enum_cmd(state, input, lines),
-                'a' => append_cmd(state, input, lines),
-                'i' => insert_cmd(state, input, lines),
-                'c' => change_cmd(state, input, lines),
-                'm' => move_cmd(state, input, lines),
-                't' => transfer_cmd(state, input, lines),
-                'd' => delete_cmd(state, input, lines),
-                'j' => join_cmd(state, input, lines),
-                'e' => edit_cmd(state, input, lines),
-                'f' => filename_cmd(state, input, lines),
-                'w' => write_cmd(state, input, lines),
-                'r' => read_cmd(state, input, lines),
-                'k' => mark_cmd(state, input, lines),
-                'x' => copy_cmd(state, input, lines),
-                'y' => yank_cmd(state, input, lines),
-                '=' => print_line_cmd(state, input, lines),
-                '\n' => empty_cmd(state, input, lines),
+                'q' => quit_cmd(state, lines),
+                'p' => print_cmd(state, lines),
+                'l' => list_cmd(state, lines),
+                'n' => enum_cmd(state, lines),
+                'a' => append_cmd(state, lines),
+                'i' => insert_cmd(state, lines),
+                'c' => change_cmd(state, lines),
+                'm' => move_cmd(state, lines),
+                't' => transfer_cmd(state, lines),
+                'd' => delete_cmd(state, lines),
+                'j' => join_cmd(state, lines),
+                'e' => edit_cmd(state, lines),
+                'f' => filename_cmd(state, lines),
+                'w' => write_cmd(state, lines),
+                'r' => read_cmd(state, lines),
+                'k' => mark_cmd(state, lines),
+                'x' => copy_cmd(state, lines),
+                'y' => yank_cmd(state, lines),
+                '=' => print_line_cmd(state, lines),
+                '\n' => empty_cmd(state, lines),
                 _   => {
                     err(io::ErrorKind::InvalidData, "unknown command")
                 },
             };
         result
     } else {
-        print_cmd(state, input, lines)
+        print_cmd(state, lines)
     }
 }
 
-fn run<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) -> io::Result<bool> {
-    let lines = get_lines(state, input)?;
-    input.skip_ws();
+fn run(state: &mut State) -> io::Result<bool> {
+    state.mode = Mode::Command;
+    let lines = get_lines(state)?;
+    state.skip_ws()?;
 
-    if let Some(c) = input.current() {
+    if let Some(c) = state.current_char()? {
         let mut last_cmd = Some(c);
-        input.skip();
+        state.skip_char()?;
         let result =
             match c {
-                'q' => quit_cmd(state, input, lines),
-                'p' => print_cmd(state, input, lines),
-                'l' => list_cmd(state, input, lines),
-                'n' => enum_cmd(state, input, lines),
-                'a' => append_cmd(state, input, lines),
-                'i' => insert_cmd(state, input, lines),
-                'c' => change_cmd(state, input, lines),
-                'm' => move_cmd(state, input, lines),
-                't' => transfer_cmd(state, input, lines),
-                'd' => delete_cmd(state, input, lines),
-                'j' => join_cmd(state, input, lines),
-                'e' => edit_cmd(state, input, lines),
-                'f' => filename_cmd(state, input, lines),
-                'w' => write_cmd(state, input, lines),
-                'r' => read_cmd(state, input, lines),
-                'g' => global_cmd(state, input, lines),
-                'v' => vlobal_cmd(state, input, lines),
-                'P' => prompt_cmd(state, input, lines),
-                'k' => mark_cmd(state, input, lines),
-                'x' => copy_cmd(state, input, lines),
-                'y' => yank_cmd(state, input, lines),
-                '=' => print_line_cmd(state, input, lines),
-                '\n' => empty_cmd(state, input, lines),
+                'q' => quit_cmd(state, lines),
+                'p' => print_cmd(state, lines),
+                'l' => list_cmd(state, lines),
+                'n' => enum_cmd(state, lines),
+                'a' => append_cmd(state, lines),
+                'i' => insert_cmd(state, lines),
+                'c' => change_cmd(state, lines),
+                'm' => move_cmd(state, lines),
+                't' => transfer_cmd(state, lines),
+                'd' => delete_cmd(state, lines),
+                'j' => join_cmd(state, lines),
+                'e' => edit_cmd(state, lines),
+                'f' => filename_cmd(state, lines),
+                'w' => write_cmd(state, lines),
+                'r' => read_cmd(state, lines),
+                'g' => global_cmd(state, lines),
+                'v' => vlobal_cmd(state, lines),
+                'P' => prompt_cmd(state, lines),
+                'k' => mark_cmd(state, lines),
+                'x' => copy_cmd(state, lines),
+                'y' => yank_cmd(state, lines),
+                '=' => print_line_cmd(state, lines),
+                '\n' => empty_cmd(state, lines),
                 _   => {
                     err(io::ErrorKind::InvalidData, "unknown command")
                 },
@@ -1576,40 +1583,49 @@ fn run<I: Iterator<Item=char> + Clone>(state: &mut State, input: &mut Input<I>) 
 }
 
 fn main() -> io::Result<()> {
-    let mut stdin = BufReader::new(io::stdin());
-    let mut stdout = io::stdout();
-
     let mut state = State::new();
-
+    let mut prompt_arg = false;
     for arg in std::env::args().skip(1) {
-        if arg.len() > 0 {
-            let fname = arg.clone();
-            match load(&Some(fname.clone())) {
-                Ok((size, lines)) => {
-                    state.set_lines(lines);
-                    state.default_filename = Some(fname);
-                    println!("{}", size);
-                },
-                Err(e) =>  {
-                    eprintln!("{}: {}", fname, e);
-
-                    // If the file does not exist, we remember the
-                    // filename because the user might want to create
-                    // a new file.
-                    if e.kind() == io::ErrorKind::NotFound {
-                        state.default_filename = Some(fname);
-                    }
-                },
-            }
+        if  arg == "-p" {
+            state.print_prompt = true;
+            prompt_arg = true;
+        } else if arg == "-" {
+            // Ignore "-"
+        } else if arg == "" {
             break;
+        } else {
+            let fname = arg.clone();
+            if prompt_arg {
+                state.prompt = Some(arg.clone());
+                prompt_arg = false;
+            } else {
+                match load(&Some(fname.clone())) {
+                    Ok((size, lines)) => {
+                        state.set_lines(lines);
+                        state.default_filename = Some(fname);
+                        println!("{}", size);
+                    },
+                    Err(e) =>  {
+                        eprintln!("{}: {}", fname, e);
+
+                        // If the file does not exist, we remember the
+                        // filename because the user might want to create
+                        // a new file.
+                        if e.kind() == io::ErrorKind::NotFound {
+                            state.default_filename = Some(fname);
+                        }
+                    },
+                }
+                break;
+            }
         }
     }
 
     // Main loop. Read top-level commands an execute them until one of
     // them returns false (indicating that the loop should not
     // continue).
-    while let Some(buf) = read_command_line(&mut state, &mut stdin, &mut stdout)? {
-        match run(&mut state, &mut Input::new(buf.chars())) {
+    loop {
+        match run(&mut state) {
             Ok(true) => {
             },
             Ok(false) => {
