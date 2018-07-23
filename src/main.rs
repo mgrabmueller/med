@@ -1,26 +1,54 @@
+/// This is an implementation of ed.
+///
+/// It is not fully compatible with POSIX ed (or GNU ed, or whatever
+/// ed...), but that's not the goal.  The goal is just to have fun
+/// with some retro computing and to learn more Rust.
+///
 use std::io::{self, Write, BufRead, BufReader, BufWriter};
 use std::fs::{File};
 
 type Lines = Option<(usize, usize)>;
 
+/// Editor mode.
 enum Mode {
+    /// Command mode. In this mode, ed commands are entered to
+    /// manipulate the buffer contents.
     Command,
+    /// Input mode.  This is used to add new text (or replacement
+    /// text) to the buffer.
     Input,
 }
 
+/// Print flag.  This indicates the style of a print command (or print
+/// command suffix).
 enum PrintFlag {
+    /// Just print the text lines.
     Print,
+    /// Print the text line with the line number in front.
     Enumerate,
+    /// "Unabiguously print" lines.  Means that control characters are
+    /// printed in a visible way and that the line end is marked with
+    /// a '$'.  All '$' within the lines are escaped with a backslash
+    /// ('\').
     List,
 }
 
+/// Internal representation of a text line in the buffer.
 struct Line {
+    /// Tells whether the line was matched by the pattern of a 'g' or
+    /// 'v' command.
     mark: bool,
+    /// If the line has been marked with the 'k' command, this holds
+    /// the mark character for the line.
     mark_char: Option<char>,
+    /// The actual text string.  This does *not* include the
+    /// terminating newline ('\n') character.
     text: String,
 }
 
 impl Line {
+    /// Creaate a new line from a string, which is not supposed to be
+    /// terminated by a newline ('\n') character.
     fn new(s: String) -> Self {
         Line {
             mark: false,
@@ -30,33 +58,80 @@ impl Line {
     }
 }
 
-struct State {
+/// Editor state. Holds all state required to run the editor
+/// machinery, including readers and writers for in- and output of
+/// commands and results.  In- and output can be mocked for testing,
+/// but file operations not yet.
+struct State<R: BufRead, W: Write> {
+    /// Read to read commands and text input from.
+    input_reader: R,
+    /// True when EOF has been detected.
+    input_eof: bool,
+    /// Writer to write print output and diagnostics to.
+    output_writer: W,
+    /// Whether the editor is in command or input mode.
     mode: Mode,
+    /// If true, show an error message after the '?' response.
+    show_help: bool,
+    /// Most recent error. Is never cleared, only overwritten when a
+    /// new error occurs.
+    last_error: Option<io::Error>,
+    /// Default filename to use for file operations.  Set from command
+    /// line argument (if given) or the 'f' (filename) or 'e' (edit)
+    /// command.
     default_filename: Option<String>,
+    /// Buffer contents.
     lines: Vec<Line>,
+    /// Address of current line (1-based).
     current_line: usize,
+    /// True if the buffer has been modified since reading it in or
+    /// the last 'w' command.
     modified: bool,
+    /// Character of last command (if any), used when repeating
+    /// commands to override warnings (such as 'q' or 'e').
     last_command: Option<char>,
-    prompt: Option<String>,
+    /// Prompt to display: defaults to '*' (asterisk).
+    prompt: String,
+    /// If true, the prompt is output before each command line is
+    /// read.
     print_prompt: bool,
+    /// Last pattern used in regexp line addressing, 's', 'g' or 'v'
+    /// commands.
     last_pattern: Option<Vec<Pat>>,
+    /// Buffer used by 'y' (yank) and 'x' (paste) commands.
     cut_buffer: Option<Vec<String>>,
+    /// Buffer for input lines, used in 'g' and 'v' commands to
+    /// simulate input from their command parameters.  If not empty,
+    /// input for commands and text input is taken from this vector
+    /// instead of the normal input reader.
     input_lines: Vec<String>,
+    /// Most recent input line as a vector.
     input_line: Vec<char>,
+    /// Current read position in 'input_line'.
     input_p: usize,
+    /// Flag if a 'g' or 'v' command is currently active.  Used
+    /// e.g. to suppress prompt output and reading from stdin.
     exec_global: bool,
 }
 
-impl State {
-    fn new() -> Self {
+impl<R: BufRead, W: Write> State<R, W> {
+    /// Create a new editor state from the given reader and writer.
+    /// Using these parameters, the editor can easily be tested by
+    /// passing in e.g. Cursor's and Vec's.
+    fn new(input: R, output: W) -> Self {
         State{
+            input_reader: input,
+            input_eof: false,
+            output_writer: output,
             mode: Mode::Command,
+            show_help: false,
+            last_error: None,
             default_filename: None,
             lines: Vec::new(),
             current_line: 0,
             modified: false,
             last_command: None,
-            prompt: Some("*".into()),
+            prompt: "*".into(),
             print_prompt: false,
             last_pattern: None,
             cut_buffer: None,
@@ -67,12 +142,18 @@ impl State {
         }
     }
 
+    // Mark the line 'line' with the character 'mark' and make sure
+    // that it is the only line thus marked.
     fn mark_line(&mut self, line: usize, mark: char) {
         for (i, l) in self.lines.iter_mut().enumerate() {
             if i == line - 1 {
                 l.mark_char = Some(mark);
             } else {
-                l.mark_char = None;
+                if let Some(c) = l.mark_char {
+                    if c == mark {
+                        l.mark_char = None;
+                    }
+                }
             }
         }
     }
@@ -143,26 +224,43 @@ impl State {
         }
     }
 
+    // Write a prompt to the current output writer (without a newline) and
+    // flush it to the terminal.
+    fn prompt(&mut self) -> io::Result<()> {
+        match (&self.mode, self.print_prompt) {
+            (Mode::Command, true) => {
+                write!(self.output_writer, "{}", self.prompt)?;
+                self.output_writer.flush()?
+            },
+            _ => {},
+        }
+        Ok(())
+    }
+
     fn read_line(&mut self) -> io::Result<Option<String>> {
         if self.input_lines.is_empty() && !self.exec_global {
-            let stdin = io::stdin();
-            let mut stdout = io::stdout();
 
-            prompt(self, &mut stdout)?;
+            if self.input_eof {
+                return Ok(None);
+            }
+            
+            self.prompt()?;
 
             let mut buf = String::new();
-            let mut cnt = stdin.read_line(&mut buf)?;
+            let mut cnt = self.input_reader.read_line(&mut buf)?;
             if cnt > 0 {
                 while buf.ends_with("\\\n") {
                     let _ = buf.pop();
                     let _ = buf.pop();
                     buf.push('\n');
-                    cnt = stdin.read_line(&mut buf)?;
+                    cnt = self.input_reader.read_line(&mut buf)?;
                     if cnt == 0 {
+                        self.input_eof = true;
                         break;
                     }
                 }
             } else {
+                self.input_eof = true;
                 return Ok(None);
             }
             return Ok(Some(buf));
@@ -296,7 +394,7 @@ fn invalid_pattern_err<R>() -> io::Result<R> {
 // Return an error value if the given input contains any remaining
 // non-whitespace characters.  Will also ignore newlines and carriage
 // returns.
-fn any_arg_err(state: &mut State) -> io::Result<()> {
+fn any_arg_err<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<()> {
     state.skip_ws()?;
     match state.current_char()? {
         None => Ok(()),
@@ -331,25 +429,6 @@ fn any_address_err(l: Lines) -> io::Result<()> {
 
 }
 
-// Write a prompt to stdout (without a newline) and flush it to the
-// terminal.
-fn prompt<W: Write>(state: &State, stdout: &mut W) -> io::Result<()> {
-    match (&state.mode, state.print_prompt) {
-        (Mode::Command, true) =>
-            match &state.prompt {
-                None => {
-                    return err(io::ErrorKind::Other, "no prompt set");
-                },
-                Some(p) => {
-                    print!("{}", p);
-                    stdout.flush()?
-                },
-            },
-        _ => {},
-    }
-    Ok(())
-}
-
 // Convert a character in the range '0'..'9' (inclusive) to its
 // numeric counterpart in the range 0..9.
 fn atoi(c: char) -> usize {
@@ -371,7 +450,7 @@ fn default_lines(l: Lines, line1: usize, line2: usize) -> (usize, usize) {
 // it. If not found, return None.  The print flag can then be passed
 // to the `do_print` function in order to conditionally print a range
 // of lines.
-fn print_flag(state: &mut State) -> io::Result<Option<PrintFlag>>
+fn print_flag<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<Option<PrintFlag>>
 {
     if !state.eol() {
         if let Some(c) = state.current_char()? {
@@ -393,7 +472,7 @@ fn print_flag(state: &mut State) -> io::Result<Option<PrintFlag>>
 // `c`, which must be in the range '0'..'9' (inclusive).  Will stop as
 // soon as a non-numeric character is found (or a the end of input).
 // Returns the result wrapped in a `io::Result` for convenience.
-fn get_num(state: &mut State, c: char) -> io::Result<usize> {
+fn get_num<R: BufRead, W: Write>(state: &mut State<R, W>, c: char) -> io::Result<usize> {
     let mut acc = atoi(c);
     state.skip_char()?;
     while let Some(c) = state.current_char()? {
@@ -416,7 +495,7 @@ fn get_num(state: &mut State, c: char) -> io::Result<usize> {
 // number is out of bounds.  Note that this might return a line number
 // of 0.  Returns the result wrapped in a `io::Result` for
 // convenience.
-fn get_rel_line(state: &State, sign: char, base: usize, amount: usize) -> io::Result<Option<usize>> {
+fn get_rel_line<R: BufRead, W: Write>(state: &State<R, W>, sign: char, base: usize, amount: usize) -> io::Result<Option<usize>> {
     if sign == '-' {
         if base >= amount {
             Ok(Some(base - amount))
@@ -455,7 +534,7 @@ fn dec_mod_line(l: usize, last: usize) -> usize {
 // Get the line address matching the pattern at the current input
 // position, which starts with character `scan_char` (either `/` or
 // `?`).
-fn get_scan_pattern(state: &mut State, scan_char: char) -> io::Result<usize>
+fn get_scan_pattern<R: BufRead, W: Write>(state: &mut State<R, W>, scan_char: char) -> io::Result<usize>
 {
     let pat = get_pattern(state)?;
     let search_pat =
@@ -534,7 +613,7 @@ fn get_scan_pattern(state: &mut State, scan_char: char) -> io::Result<usize>
 // $+
 // $-
 //
-fn get_line_number(state: &mut State) -> io::Result<Option<usize>>
+fn get_line_number<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<Option<usize>>
 {
     state.skip_ws()?;
     if let Some(c) = state.current_char()? {
@@ -629,7 +708,7 @@ fn get_line_number(state: &mut State) -> io::Result<Option<usize>>
    }
 }
 
-fn get_lines(state: &mut State) -> io::Result<Lines>
+fn get_lines<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<Lines>
 {
 
     // Get optional first line address.
@@ -689,13 +768,14 @@ fn get_lines(state: &mut State) -> io::Result<Lines>
     }
 }
 
-fn get_argument(state: &mut State) -> io::Result<Option<String>> {
+fn get_argument<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<Option<String>> {
     state.skip_ws()?;
-    if state.current_char()?.is_some() {
+    if !state.eol() {
         let mut arg = String::new();
         loop {
             if let Some(c) = state.current_char()? {
                 if c == '\n' {
+                    state.drop_char()?;
                     break;
                 }
                 arg.push(c);
@@ -710,11 +790,12 @@ fn get_argument(state: &mut State) -> io::Result<Option<String>> {
             Ok(None)
         }
     } else {
+        state.skip_to_nl()?;
         Ok(None)
     }
 }
 
-fn get_char_class(state: &mut State) -> io::Result<String> {
+fn get_char_class<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<String> {
     let mut class = String::new();
     while let Some(c) = state.current_char()? {
         match c {
@@ -809,7 +890,7 @@ fn match_pattern(cpat: &Vec<Pat>, target0: &str) -> Option<usize> {
     None
 }
 
-fn get_atomic_pattern(state: &mut State) -> io::Result<Pat>
+fn get_atomic_pattern<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<Pat>
 {
     if let Some(c) = state.current_char()? {
         if c == '\\' {
@@ -842,7 +923,7 @@ fn get_atomic_pattern(state: &mut State) -> io::Result<Pat>
     }
 }
 
-fn get_pattern1(state: &mut State, delim: char) -> io::Result<Vec<Pat>>
+fn get_pattern1<R: BufRead, W: Write>(state: &mut State<R, W>, delim: char) -> io::Result<Vec<Pat>>
 {
     let mut pattern = Vec::new();
 
@@ -869,7 +950,7 @@ fn get_pattern1(state: &mut State, delim: char) -> io::Result<Vec<Pat>>
     Ok(pattern)
 }
 
-fn get_pattern(state: &mut State) -> io::Result<Vec<Pat>> {
+fn get_pattern<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<Vec<Pat>> {
     state.skip_ws()?;
 
     if let Some(c) = state.current_char()? {
@@ -908,12 +989,12 @@ fn get_pattern(state: &mut State) -> io::Result<Vec<Pat>> {
 
 // Quit command (q).  Ensures that no line addresses and no parameters
 // are given and returns false, which will terminate the main loop.
-fn quit_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn quit_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines, force: bool) -> io::Result<bool>
 {
     any_address_err(l)?;
     any_arg_err(state)?;
 
-    if state.modified && state.last_command != Some('q') {
+    if !force && state.modified && state.last_command != Some('q') {
         return err(io::ErrorKind::Other, "buffer modified")
     }
 
@@ -925,14 +1006,14 @@ fn quit_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // than zero and that no parameters are given.  Then prints all lines
 // in the line range to the terminal and set the current line to the
 // last line printed.
-fn print_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn print_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
     any_arg_err(state)?;
 
-    do_print(state, line1, line2, Some(PrintFlag::Print));
+    do_print(state, line1, line2, Some(PrintFlag::Print))?;
 
     state.current_line = line2;
     Ok(true)
@@ -942,14 +1023,14 @@ fn print_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // end of each line, a dollar ($) character is printed.  All dollar
 // characters that appear on lines are prefixed with a backslash (\)
 // character.
-fn list_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn list_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
     any_arg_err(state)?;
 
-    do_print(state, line1, line2, Some(PrintFlag::List));
+    do_print(state, line1, line2, Some(PrintFlag::List))?;
 
     state.current_line = line2;
     Ok(true)
@@ -957,14 +1038,14 @@ fn list_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 
 // Enumerate command (n). Print each line in the address range,
 // prefixing each line with it's line number.
-fn enum_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn enum_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
     zero_address_err(line1)?;
     any_arg_err(state)?;
 
-    do_print(state, line1, line2, Some(PrintFlag::Enumerate));
+    do_print(state, line1, line2, Some(PrintFlag::Enumerate))?;
 
     state.current_line = line2;
     Ok(true)
@@ -987,7 +1068,7 @@ fn load(filename: &Option<String>) -> io::Result<(usize, Vec<String>)> {
     }
 }
 
-fn save(state: &State, filename: &Option<String>, line1: usize, line2: usize) -> io::Result<usize> {
+fn save<R: BufRead, W: Write>(state: &State<R, W>, filename: &Option<String>, line1: usize, line2: usize) -> io::Result<usize> {
     if let Some(fname) = filename {
         let mut f = BufWriter::new(File::create(fname)?);
         let mut size = 0;
@@ -1002,7 +1083,7 @@ fn save(state: &State, filename: &Option<String>, line1: usize, line2: usize) ->
     }
 }
 
-fn input_mode(state: &mut State) -> io::Result<Vec<String>> {
+fn input_mode<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<Vec<String>> {
     state.mode = Mode::Input;
     let mut lines = Vec::new();
 
@@ -1020,7 +1101,7 @@ fn input_mode(state: &mut State) -> io::Result<Vec<String>> {
 // with a single period (.) is read.  The line terminating input is
 // discarded.  The other lines are inserted into the buffer after the
 // addressed line.  The current line is set to the last line inserted.
-fn append_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn append_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (_line1, insert_line) = default_lines(l, state.current_line, state.current_line);
 
@@ -1039,7 +1120,8 @@ fn append_cmd(state: &mut State, l: Lines) -> io::Result<bool>
     state.append(insert_line, lines);
 
     state.current_line = insert_line + line_count;
-    do_print(state, state.current_line, state.current_line, pflag);
+    let cur_line = state.current_line;
+    do_print(state, cur_line, cur_line, pflag)?;
     Ok(true)
 }
 
@@ -1047,7 +1129,7 @@ fn append_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // with a single period (.) is read.  The line terminating input is
 // discarded.  The other lines are inserted into the buffer before the
 // addressed line.  The current line is set to the last line inserted.
-fn insert_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn insert_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (_line1, insert_line0) = default_lines(l, state.current_line, state.current_line);
 
@@ -1067,7 +1149,8 @@ fn insert_cmd(state: &mut State, l: Lines) -> io::Result<bool>
     state.append(insert_line - 1, lines);
 
     state.current_line = insert_line + line_count - 1;
-    do_print(state, state.current_line, state.current_line, pflag);
+    let cur_line = state.current_line;
+    do_print(state, cur_line, cur_line, pflag)?;
     Ok(true)
 }
 
@@ -1076,7 +1159,7 @@ fn insert_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // discarded.  The addresses lines are removed from the buffer and the
 // newly read lines are inserted in their place.  The current line is
 // set to the last line inserted.
-fn change_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn change_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
@@ -1093,13 +1176,14 @@ fn change_cmd(state: &mut State, l: Lines) -> io::Result<bool>
     state.append(line1 - 1, lines);
 
     state.current_line = line1 + line_count - 1;
-    do_print(state, state.current_line, state.current_line, pflag);
+    let cur_line = state.current_line;
+    do_print(state, cur_line, cur_line, pflag)?;
     Ok(true)
 }
 
 // Move command (m). Move the addressed lines after the line given as
 // an argument. The current line is set to the last line moved.
-fn move_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn move_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
@@ -1120,7 +1204,8 @@ fn move_cmd(state: &mut State, l: Lines) -> io::Result<bool>
         state.append(to_line, lines);
 
         state.current_line = to_line + line_count;
-        do_print(state, state.current_line, state.current_line, pflag);
+        let cur_line = state.current_line;
+        do_print(state, cur_line, cur_line, pflag)?;
         Ok(true)
     } else {
         return missing_address_err();
@@ -1130,7 +1215,7 @@ fn move_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // Transfer command (t). Copy the addressed lines and insert them
 // after the line given as an argument.  Set the current line to the
 // last line copied.
-fn transfer_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn transfer_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
@@ -1147,7 +1232,8 @@ fn transfer_cmd(state: &mut State, l: Lines) -> io::Result<bool>
         state.append(to_line, lines);
 
         state.current_line = to_line + line_count;
-        do_print(state, state.current_line, state.current_line, pflag);
+        let cur_line = state.current_line;
+        do_print(state, cur_line, cur_line, pflag)?;
         Ok(true)
     } else {
         return missing_address_err();
@@ -1157,7 +1243,7 @@ fn transfer_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // Delete command (d).  Remove the addressed line from the buffer.
 // Set the current line to the line after the deleted lines, if it
 // exists and to the line before otherwise.
-fn delete_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn delete_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
@@ -1168,13 +1254,14 @@ fn delete_cmd(state: &mut State, l: Lines) -> io::Result<bool>
     state.delete(line1, line2);
 
     state.current_line = std::cmp::min(state.last_line(), line1);
-    do_print(state, state.current_line, state.current_line, pflag);
+    let cur_line = state.current_line;
+    do_print(state, cur_line, cur_line, pflag)?;
     Ok(true)
 }
 
 // Join command (j). Join all lines in the given range, or if only one
 // line is given, join that line with the following one.
-fn join_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn join_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, mut line2) = default_lines(l, state.current_line, state.current_line);
 
@@ -1197,7 +1284,7 @@ fn join_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 
     state.append(line1 - 1, vec![new_line]);
 
-    do_print(state, line1, line1, pflag);
+    do_print(state, line1, line1, pflag)?;
 
     state.current_line = line1;
     Ok(true)
@@ -1206,7 +1293,7 @@ fn join_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // Copy command (x). Insert contents of the cut buffer after the
 // addressed line.  The current address is set to the last line
 // copied.
-fn copy_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn copy_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
@@ -1222,7 +1309,8 @@ fn copy_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 
         state.current_line = line2 + line_cnt;
 
-        do_print(state, state.current_line, state.current_line, pflag);
+        let cur_line = state.current_line;
+        do_print(state, cur_line, cur_line, pflag)?;
         Ok(true)
     } else {
         err(io::ErrorKind::InvalidData, "cut buffer empty")
@@ -1231,7 +1319,7 @@ fn copy_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 
 // Yank command (y). Copy (yank) the addressed lines to the cut
 // buffer.  The current addres is not changed.
-fn yank_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn yank_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, state.current_line, state.current_line);
 
@@ -1248,11 +1336,11 @@ fn yank_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // argument is given) and reads it into the edit buffer.  If the
 // buffer is modified, an error is returned.  If a filename is given,
 // it is used as the new default filename.
-fn edit_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn edit_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines, force: bool) -> io::Result<bool>
 {
     any_address_err(l)?;
 
-    if state.modified && state.last_command != Some('e') {
+    if !force && state.modified && state.last_command != Some('e') {
         return err(io::ErrorKind::Other, "buffer modified")
     }
 
@@ -1262,7 +1350,7 @@ fn edit_cmd(state: &mut State, l: Lines) -> io::Result<bool>
     state.set_lines(lines);
     state.modified = false;
     state.default_filename = fname;
-    println!("{}", size);
+    writeln!(state.output_writer, "{}", size)?;
     Ok(true)
 }
 
@@ -1271,7 +1359,7 @@ fn edit_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // argument is given) and inserts it into the edit buffer at the given
 // line (or current line, if no line is given).  The default filename
 // is unchanged.
-fn read_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn read_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (_line1, line2) = default_lines(l, state.last_line(), state.last_line());
 
@@ -1279,7 +1367,7 @@ fn read_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 
     let (size, lines) = load(&fname)?;
     state.insert_lines(line2, lines);
-    println!("{}", size);
+    writeln!(state.output_writer, "{}", size)?;
 
     Ok(true)
 }
@@ -1288,7 +1376,7 @@ fn read_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // default filename or return an error if no default filename is
 // present. If an argument is given, set the default filename to the
 // argument.
-fn filename_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn filename_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     any_address_err(l)?;
 
@@ -1299,7 +1387,7 @@ fn filename_cmd(state: &mut State, l: Lines) -> io::Result<bool>
                 None =>
                     return err(io::ErrorKind::Other, "no filename"),
                 Some(f) =>
-                    println!("{}", f),
+                    writeln!(state.output_writer, "{}", f)?,
             },
         Some(_) =>
             state.default_filename = fname,
@@ -1312,7 +1400,7 @@ fn filename_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // the addressed lines (or the complete buffer contents if no lines
 // are specified) to the given file (or the default filename if none
 // is given) and mark the buffer as unmodified.
-fn write_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn write_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, 1, state.last_line());
 
@@ -1321,13 +1409,13 @@ fn write_cmd(state: &mut State, l: Lines) -> io::Result<bool>
     let size = save(state, &fname, line1, line2)?;
     state.modified = false;
     state.default_filename = fname;
-    println!("{}", size);
+    writeln!(state.output_writer, "{}", size)?;
     Ok(true)
 }
 
 // Prompt command (P).  Set the prompt to the given argument if given
 // or toggle prompt printing otherwise.
-fn prompt_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn prompt_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     any_address_err(l)?;
 
@@ -1335,15 +1423,46 @@ fn prompt_cmd(state: &mut State, l: Lines) -> io::Result<bool>
     match new_prompt {
         None =>
             state.print_prompt = !state.print_prompt,
-        Some(_) =>
-            state.prompt = new_prompt,
+        Some(np) =>
+            state.prompt = np,
     }
 
     Ok(true)
 }
 
+// Help command (h).  Show the last error message (if any).  Do not
+// change the current line or buffer contents.
+fn help_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
+{
+    any_address_err(l)?;
+    any_arg_err(state)?;
+
+    match &state.last_error {
+        None => {},
+        Some(e) => writeln!(state.output_writer, "{}", e)?,
+    }
+    Ok(true)
+}
+
+// Toggle Help command (H).  Toggle the "show error" flag.  When that
+// flag is on, a short error message will be displayed on a new line
+// after each "?" error indicator. Also show the last error message
+// (if any).  Do not change the current line or buffer contents.
+fn toggle_help_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
+{
+    any_address_err(l)?;
+    any_arg_err(state)?;
+
+    match &state.last_error {
+        None => {},
+        Some(e) => writeln!(state.output_writer, "{}", e)?,
+    }
+    state.show_help = !state.show_help;
+    Ok(true)
+}
+
 // Work horse for the g and v commands.
-fn global_execute(state: &mut State, l: Lines, include: bool) -> io::Result<bool>
+fn global_execute<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines, include: bool) -> io::Result<bool>
 {
     let (line1, line2) = default_lines(l, 1, state.last_line());
 
@@ -1389,7 +1508,7 @@ fn global_execute(state: &mut State, l: Lines, include: bool) -> io::Result<bool
 
 // Global command (g).  Mark a set of lines matching the argument and
 // then execute the following commands on all of the marked lines.
-fn global_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn global_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     global_execute(state, l, true)
 }
@@ -1397,14 +1516,14 @@ fn global_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // Global exclusion command (v).  Mark a set of lines NOT matching the
 // argument and then execute the following commands on all of the
 // marked lines.
-fn vlobal_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn vlobal_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     global_execute(state, l, false)
 }
 
 // Mark command (k).  Marks the addressed line with the letter given
 // as an argument.
-fn mark_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn mark_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (_line1, line2) = default_lines(l, state.current_line, state.current_line);
 
@@ -1426,13 +1545,13 @@ fn mark_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // Print line command (=).  Defaults lines to the last line and
 // verifies that no parameters are given.  Then prints the number of
 // the last line address.
-fn print_line_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn print_line_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     let (_line1, line2) = default_lines(l, state.last_line(), state.last_line());
 
     any_arg_err(state)?;
 
-    println!("{}", line2);
+    writeln!(state.output_writer, "{}", line2)?;
     Ok(true)
 }
 
@@ -1440,7 +1559,7 @@ fn print_line_cmd(state: &mut State, l: Lines) -> io::Result<bool>
 // are given, it sets the current line to the last line, otherwise, it
 // prints the current line and increments the current line number,
 // wrapping around to the first line if necessary.
-fn empty_cmd(state: &mut State, l: Lines) -> io::Result<bool>
+fn empty_cmd<R: BufRead, W: Write>(state: &mut State<R, W>, l: Lines) -> io::Result<bool>
 {
     any_arg_err(state)?;
 
@@ -1458,47 +1577,48 @@ fn empty_cmd(state: &mut State, l: Lines) -> io::Result<bool>
     }
 }
 
-fn do_print(state: &State, line1: usize, line2: usize, pflag: Option<PrintFlag>) {
+fn do_print<R: BufRead, W: Write>(state: &mut State<R, W>, line1: usize, line2: usize, pflag: Option<PrintFlag>) -> io::Result<()>{
     match pflag {
         Some(PrintFlag::Print) => {
             for l in line1..=line2 {
-                println!("{}", state.lines[l - 1].text);
+                writeln!(state.output_writer, "{}", state.lines[l - 1].text)?;
             }
         },
         Some(PrintFlag::Enumerate) => {
             for l in line1..=line2 {
-                println!("{} {}",
+                writeln!(state.output_writer, "{} {}",
                          l,
-                         state.lines[l-1].text);
+                         state.lines[l-1].text)?;
             }
         },
         Some(PrintFlag::List) => {
             for l in line1..=line2 {
                 for c in state.lines[l - 1].text.chars() {
                     match c {
-                        '$' => print!("\\$"),
-                        '\t' => print!(">"),
-                        '\x08' => print!("<"),
+                        '$' => write!(state.output_writer, "\\$")?,
+                        '\t' => write!(state.output_writer, ">")?,
+                        '\x08' => write!(state.output_writer, "<")?,
                         _ =>
                             if c < ' ' {
                                 // Formula taken from 2.11BSD ed (see
                                 // https://minnie.tuhs.org//cgi-bin/utree.pl?file=2.11BSD/src/bin/ed.c)
                                 let l1 = (((c as u8) >> 3) + ('0' as u8)) as char;
                                 let l2 = (((c as u8) & 0x7) + ('0' as u8)) as char;
-                                print!("\\{}{}", l1, l2);
+                                write!(state.output_writer, "\\{}{}", l1, l2)?;
                             } else {
-                                print!("{}", c);
+                                write!(state.output_writer, "{}", c)?;
                             },
                     }
                 }
-                println!("$");
+                writeln!(state.output_writer, "$")?;
             }
         },
         None => {},
     }
+    Ok(())
 }
 
-fn run_one(state: &mut State) -> io::Result<bool>
+fn run_one<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<bool>
 {
     state.mode = Mode::Command;
     let lines = get_lines(state)?;
@@ -1508,7 +1628,8 @@ fn run_one(state: &mut State) -> io::Result<bool>
         state.skip_char()?;
         let result =
             match c {
-                'q' => quit_cmd(state, lines),
+                'q' => quit_cmd(state, lines, false),
+                'Q' => quit_cmd(state, lines, true),
                 'p' => print_cmd(state, lines),
                 'l' => list_cmd(state, lines),
                 'n' => enum_cmd(state, lines),
@@ -1519,13 +1640,16 @@ fn run_one(state: &mut State) -> io::Result<bool>
                 't' => transfer_cmd(state, lines),
                 'd' => delete_cmd(state, lines),
                 'j' => join_cmd(state, lines),
-                'e' => edit_cmd(state, lines),
+                'e' => edit_cmd(state, lines, false),
+                'E' => edit_cmd(state, lines, true),
                 'f' => filename_cmd(state, lines),
                 'w' => write_cmd(state, lines),
                 'r' => read_cmd(state, lines),
                 'k' => mark_cmd(state, lines),
                 'x' => copy_cmd(state, lines),
                 'y' => yank_cmd(state, lines),
+                'h' => help_cmd(state, lines),
+                'H' => toggle_help_cmd(state, lines),
                 '=' => print_line_cmd(state, lines),
                 '\n' => empty_cmd(state, lines),
                 _   => {
@@ -1538,7 +1662,7 @@ fn run_one(state: &mut State) -> io::Result<bool>
     }
 }
 
-fn run(state: &mut State) -> io::Result<bool> {
+fn run<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<bool> {
     state.mode = Mode::Command;
     let lines = get_lines(state)?;
     state.skip_ws()?;
@@ -1548,7 +1672,8 @@ fn run(state: &mut State) -> io::Result<bool> {
         state.skip_char()?;
         let result =
             match c {
-                'q' => quit_cmd(state, lines),
+                'q' => quit_cmd(state, lines, false),
+                'Q' => quit_cmd(state, lines, true),
                 'p' => print_cmd(state, lines),
                 'l' => list_cmd(state, lines),
                 'n' => enum_cmd(state, lines),
@@ -1559,7 +1684,8 @@ fn run(state: &mut State) -> io::Result<bool> {
                 't' => transfer_cmd(state, lines),
                 'd' => delete_cmd(state, lines),
                 'j' => join_cmd(state, lines),
-                'e' => edit_cmd(state, lines),
+                'e' => edit_cmd(state, lines, false),
+                'E' => edit_cmd(state, lines, true),
                 'f' => filename_cmd(state, lines),
                 'w' => write_cmd(state, lines),
                 'r' => read_cmd(state, lines),
@@ -1569,6 +1695,8 @@ fn run(state: &mut State) -> io::Result<bool> {
                 'k' => mark_cmd(state, lines),
                 'x' => copy_cmd(state, lines),
                 'y' => yank_cmd(state, lines),
+                'h' => help_cmd(state, lines),
+                'H' => toggle_help_cmd(state, lines),
                 '=' => print_line_cmd(state, lines),
                 '\n' => empty_cmd(state, lines),
                 _   => {
@@ -1582,8 +1710,31 @@ fn run(state: &mut State) -> io::Result<bool> {
     }
 }
 
+fn main_loop<R: BufRead, W: Write>(state: &mut State<R, W>) -> io::Result<()> {
+    // Main loop. Read top-level commands an execute them until one of
+    // them returns false (indicating that the loop should not
+    // continue).
+    loop {
+        match run(state) {
+            Ok(true) => {
+            },
+            Ok(false) => {
+                break;
+            },
+            Err(e) => {
+                writeln!(state.output_writer, "?")?;
+                if state.show_help {
+                    writeln!(state.output_writer, "{}", e)?;
+                }
+                state.last_error = Some(e);
+            },
+        }
+    }
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
-    let mut state = State::new();
+    let mut state = State::new(BufReader::new(io::stdin()), io::stdout());
     let mut prompt_arg = false;
     for arg in std::env::args().skip(1) {
         if  arg == "-p" {
@@ -1596,17 +1747,17 @@ fn main() -> io::Result<()> {
         } else {
             let fname = arg.clone();
             if prompt_arg {
-                state.prompt = Some(arg.clone());
+                state.prompt = arg.clone();
                 prompt_arg = false;
             } else {
                 match load(&Some(fname.clone())) {
                     Ok((size, lines)) => {
                         state.set_lines(lines);
                         state.default_filename = Some(fname);
-                        println!("{}", size);
+                        writeln!(state.output_writer, "{}", size)?;
                     },
                     Err(e) =>  {
-                        eprintln!("{}: {}", fname, e);
+                        writeln!(state.output_writer, "{}: {}", fname, e)?;
 
                         // If the file does not exist, we remember the
                         // filename because the user might want to create
@@ -1621,82 +1772,89 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // Main loop. Read top-level commands an execute them until one of
-    // them returns false (indicating that the loop should not
-    // continue).
-    loop {
-        match run(&mut state) {
-            Ok(true) => {
-            },
-            Ok(false) => {
-                break;
-            },
-            Err(e) =>
-                println!("? {}", e),
-        }
-    }
-
-    Ok(())
+    main_loop(&mut state)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
 
-    fn mk_input(buf: &str) -> Input<std::str::Chars> {
-        Input::new(buf.chars())
+    use std::io::{Cursor};
+    
+    fn run_ed(input: &str, text: &str) -> (Vec<Line>, Vec<u8>) {
+        let input_reader = Cursor::new(input);
+        let mut output = Vec::new();
+        let buffer =
+        {
+            let mut state = State::new(input_reader, &mut output);
+            state.set_lines(text.lines().map(|s| s.to_string()).collect());
+
+            let _ = main_loop(&mut state).unwrap();
+            state.lines
+        };
+        (buffer, output)
     }
 
     #[test]
-    fn simple_pattern() {
-        let mut input = mk_input("/a/");
-        let expected = vec![Pat::Char('a')];
-        let p = get_pattern(&mut input).unwrap();
-        assert_eq!(p, expected);
+    fn quit_unmodified() {
+        let (b, o) = run_ed("q\n", "");
+        assert_eq!(o, b"");
+        assert_eq!(b.len(), 0);
     }
 
     #[test]
-    fn empty_pattern() {
-        let mut input = mk_input("//");
-        let expected = vec![];
-        let p = get_pattern(&mut input).unwrap();
-        assert_eq!(p, expected);
+    fn quit_unmodified2() {
+        let (b, o) = run_ed("q\n", "line\n");
+        assert_eq!(o, b"");
+        assert_eq!(b.len(), 1);
     }
 
     #[test]
-    fn back_pattern() {
-        let mut input = mk_input("?abc?");
-        let expected = vec![Pat::Char('a'), Pat::Char('b'), Pat::Char('c')];
-        let p = get_pattern(&mut input).unwrap();
-        assert_eq!(p, expected);
+    fn quit_modified() {
+        let (b, o) = run_ed("1d\nq\n", "line\n");
+        assert_eq!(o, b"?\n");
+        assert_eq!(b.len(), 0);
     }
 
     #[test]
-    fn bol_anchor_pattern() {
-        let mut input = mk_input("/^a/");
-        let expected = vec![Pat::Bol, Pat::Char('a')];
-        let p = get_pattern(&mut input).unwrap();
-        assert_eq!(p, expected);
+    fn quit_modified2() {
+        let (b, o) = run_ed("1d\nq\nq\n", "line\n");
+        assert_eq!(o, b"?\n");
+        assert_eq!(b.len(), 0);
     }
 
     #[test]
-    fn bol_anchor_pattern_error() {
-        let mut input = mk_input("/a^/");
-        assert!(get_pattern(&mut input).is_err());
+    fn quit_modified3() {
+        let (b, o) = run_ed("1d\nQ\n", "line\n");
+        assert_eq!(o, b"");
+        assert_eq!(b.len(), 0);
     }
 
     #[test]
-    fn eol_anchor_pattern() {
-        let mut input = mk_input("/a$/");
-        let expected = vec![Pat::Char('a'), Pat::Eol];
-        let p = get_pattern(&mut input).unwrap();
-        assert_eq!(p, expected);
+    fn prompt_toggle() {
+        let (b, o) = run_ed("P\n", "");
+        assert_eq!(o, b"*");
+        assert_eq!(b.len(), 0);
     }
 
     #[test]
-    fn eol_anchor_pattern_error() {
-        let mut input = mk_input("/$a/");
-        assert!(get_pattern(&mut input).is_err());
+    fn prompt_set() {
+        let (b, o) = run_ed("P gimme>\n", "");
+        assert_eq!(o, b"");
+        assert_eq!(b.len(), 0);
     }
 
+    #[test]
+    fn prompt_set2() {
+        let (b, o) = run_ed("P gimme>\nP\n", "");
+        assert_eq!(o, b"gimme>");
+        assert_eq!(b.len(), 0);
+    }
+
+    #[test]
+    fn mark() {
+        let (b, o) = run_ed("2ka\n'ad\n,p\n", "line1\nline2\nline3\n");
+        assert_eq!(o, b"line1\nline3\n");
+        assert_eq!(b.len(), 2);
+    }
 }
